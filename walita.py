@@ -111,6 +111,10 @@ def main(argv=None):
         help="Dashboard nach dem Bau im Browser öffnen (Default).",
     )
     dash.add_argument(
+        "--output", "-o", default="data/dashboard.html",
+        help="Ziel-HTML-Datei (Default: data/dashboard.html).",
+    )
+    dash.add_argument(
         "--no-open", action="store_false", dest="open",
         help="Dashboard nicht im Browser öffnen.",
     )
@@ -241,6 +245,7 @@ def main(argv=None):
             edit_argv.append("--ignore-plus")
         if args.scale is not None:
             edit_argv.extend(["--scale", str(args.scale)])
+        edit_argv.extend(["--dashboard-output", args.output])
         edit_argv.extend(["--loc-class-families", args.loc_class_families])
         edit_argv.extend(["--edge-patches", args.edge_patches])
         edit_argv.extend(["--station-patches", args.station_patches])
@@ -257,7 +262,7 @@ def main(argv=None):
         dash_argv = [
             "--statuses", "examples/statuses.json",
             "--stations", "examples/stations.json",
-            "-o", "data/dashboard.html",
+            "--output", args.output,
         ]
         if args.open:
             dash_argv.append("--open")
@@ -308,6 +313,7 @@ def main(argv=None):
             return rc
 
     dash_argv = []
+    dash_argv.extend(["--output", args.output])
     if args.open:
         dash_argv.append("--open")
     if args.ignore_plus:
