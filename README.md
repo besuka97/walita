@@ -42,6 +42,25 @@ cd walita
 python3 walita.py --demo    # ohne Token ausprobieren
 ```
 
+### Docker (Fortgeschrittene Nutzung)
+
+Du kannst einen Docker-Container erstellen, der einen minimalen Webserver enthält,
+regelmäßig `walita` ausführt und das Dashboard auf Port 8080 bereitstellt.
+Um den Container zu erstellen, führe im Stammverzeichnis des Repositorys
+`docker build . -f docker/Dockerfile -t walita` aus.
+Um die Autorisierung zu vereinfachen, muss mindestens
+`data/oauth_token.json` als `/app/data/oauth_token.json` in den Docker-Container
+eingebunden werden.
+Es wird empfohlen, stattdessen das gesamte Verzeichnis `data` einzubinden.
+Die Häufigkeit, mit der `walita` ausgeführt wird – und damit auch, wie oft deine
+Daten aktualisiert werden – kann über die Umgebungsvariable `CRON_SCHEDULE`
+festgelegt werden.
+
+Beispiel:
+```bash
+docker run -p 8080:8080 -v ./data:/app/data -e 'CRON_SCHEDULE=*/15 * * * *' walita
+```
+
 ## Projektstruktur
 
 ```
