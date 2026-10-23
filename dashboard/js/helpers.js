@@ -244,6 +244,7 @@ function tripsTsv(list, opts){
   const planMin=!delayOn;
   const headers=TRIP_TSV_BASE.slice();
   if(routeOn) headers.splice(10, 0, "Laufweg");
+  if(opts.number) headers.unshift("#");
   if(delayOn) headers.push("Versp.");
   const ab=headers.indexOf("Ab");
   const an=headers.indexOf("An");
@@ -266,6 +267,7 @@ function tripsTsv(list, opts){
     }
     row.push(t.distanceKm, dur==null?"":dur);
     if(delayOn) row.push(tripDelayText(t.delay));
+    if(opts.number) row.unshift(i+1);
     lines.push(row.map(tsvCell).join("\t"));
   });
   return lines.join("\n");

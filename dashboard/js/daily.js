@@ -256,6 +256,33 @@
     return { km: Math.round(km * 10) / 10, min: Math.round(min), hasDur };
   }
 
+  // Fahrten des Tages in Reihenfolge des Check-ins (createdAt), sonst Abfahrt.
+  function dayTripsOf(d) {
+    const out = [];
+    (D().trips || []).forEach((t, i) => {
+      if ((t.date || "").slice(0, 10) === d) out.push({ ...t, _i: i });
+    });
+    const key = t => t.createdAt || t.date || "";
+    return out.sort((x, y) => key(x).localeCompare(key(y)) || x._i - y._i);
+  }
+  function appendDayTrips(d) {
+    const list = dayTripsOf(d);
+    if (!list.length) return;
+    const cell = v => `<td class="lbl">${esc(v == null || v === "" ? "—" : v)}</td>`;
+    const body = list.map((t, i) => "<tr>" +
+      `<td>${i + 1}</td><td class="lbl">${badge(t.line)}</td>` +
+      cell(t.vehicles) + cell(t.locClass) + cell(t.from) + cell(t.to) + cell(t.operator) +
+      "</tr>").join("");
+    const g = document.createElement("div");
+    g.className = "daily-group";
+    g.innerHTML = `<h3>Fahrten <span class="muted" style="font-weight:400">(${fmtN(list.length)})</span></h3>
+      <div class="panel stats-scroll" style="margin-bottom:16px"><table class="stats">
+      <thead><tr><th>#</th><th class="lbl">Linie</th><th class="lbl">Fahrzeug</th><th class="lbl">Baureihe</th>
+      <th class="lbl">Von</th><th class="lbl">Nach</th><th class="lbl">Operator</th></tr></thead>
+      <tbody>${body}</tbody></table></div>`;
+    bodyEl.appendChild(g);
+  }
+
   function render() {
     const d = dateEl.value;
     const travel = dayTravel(d);
@@ -300,6 +327,13 @@
       g.innerHTML = `<h3>${esc(title)}</h3>`;
       parts.forEach(p => g.appendChild(p));
       bodyEl.appendChild(g);
+    }
+    appendDayTrips(d);
+    if (!chips.length && hasRepeats) {
+      const note = document.createElement("p");
+      note.className = "daily-none";
+      note.textContent = "Neu: keine Erstvorkommen an diesem Tag (alles schon früher gefahren).";
+      bodyEl.appendChild(note);
     }
     appendGroup("Neu", singles, buckets, sets);
     appendGroup("Erste Kombis", combos, buckets, sets);
@@ -348,11 +382,8 @@
   function copyTsv() {
     const d = dateEl.value;
     const dateLabel = fmtDate(d) || d || "—";
-    const dayTrips = [];
-    (D().trips || []).forEach((t, i) => {
-      if ((t.date || "").slice(0, 10) === d) dayTrips.push({ ...t, _i: i });
-    });
-    const parts = [dateLabel, tripsTsv(dayTrips, { route: true })];
+    const dayTrips = dayTripsOf(d);
+    const parts = [dateLabel, tripsTsv(dayTrips, { route: true, number: true })];
     const buckets = DF[d] || {};
     const sets = cascadeSets(buckets);
     const blocks = [];
@@ -369,6 +400,9 @@
       blocks.push("Kaskadiert: Ja = folgt aus einem einfacheren Erstvorkommen am selben Tag. Nein = Ist neu.");
     }
     if (blocks.length) parts.push(blocks.join("\n\n"));
+    else if (dayTrips.length) {
+      parts.push("Neu: keine Erstvorkommen an diesem Tag (alles schon früher gefahren).");
+    }
     copyText(parts.join("\n\n"), copyBtn);
   }
 

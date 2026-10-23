@@ -701,6 +701,13 @@ zusammengefügt. Sieben Ansichten:
   nur Ein-/Ausstiege und gehaltene Stationen, keine physischen Durchfahrten.
   ‹ und › springen zum vorigen bzw. nächsten Tag mit Fahrten.
 
+- **Gesuchte Wagen** – Schnellblick für den Bahnsteig: je Baureihe mit
+  [Fuhrpark](#fuhrpark) groß und fett die nicht ausgemusterten Nummern, die
+  noch in keiner Fahrt vorkommen. Gezählt werden alle Fahrten, auch bei
+  aktiver Heimatregion. Die Baureihen-Knöpfe blenden einzelne Baureihen aus
+  (merkt sich der Browser), **Nummer prüfen** zeigt nur passende fehlende
+  Nummern.
+
 Linien, Fahrten, Fahrzeuge und Tagesziele haben **Als TSV kopieren** für die
 gerade sichtbare Tabelle (zum Einfügen in eine Tabellenkalkulation).
 

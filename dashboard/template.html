@@ -84,6 +84,7 @@
       <button data-tab="trips"><span class="ic">📋</span> Fahrten</button>
       <button data-tab="vehicles"><span class="ic">🚆</span> Fahrzeuge</button>
       <button data-tab="daily"><span class="ic">🏁</span> Tagesziele</button>
+      <button data-tab="wanted"><span class="ic">🔎</span> Gesuchte Wagen</button>
     </nav>
     <div class="sidebar-foot">
       <div class="sub" id="subtitle"></div>
@@ -264,6 +265,18 @@
         <button type="button" class="toolbar-btn" id="vehCopy">Als TSV kopieren</button>
       </div>
       <div id="vehMatrices"></div>
+    </section>
+
+    <section id="wanted" class="tab">
+      <div class="tab-head">
+        <h2>Gesuchte Wagen <span class="muted" id="wantedSummary"></span></h2>
+        <p>Nummern aus dem Fuhrpark, die noch in keiner Fahrt vorkommen (ohne ausgemusterte). Zählt alle Fahrten, auch außerhalb der Heimatregion.</p>
+      </div>
+      <div class="toolbar">
+        <div class="wanted-chips" id="wantedClasses"></div>
+        <input type="search" id="wantedFind" inputmode="numeric" placeholder="Nummer prüfen …">
+      </div>
+      <div id="wantedBody"></div>
     </section>
 
     <section id="daily" class="tab">

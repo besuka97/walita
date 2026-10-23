@@ -198,6 +198,9 @@
   table.matrix td.has { cursor:pointer; color:var(--accent); background:var(--tint,transparent);
         font-weight:600; }
   table.matrix tr.veh:hover td { background:var(--panel2); }
+  table.matrix tr.veh-total td { position:sticky; bottom:0; z-index:1; font-weight:700;
+    background:var(--panel2); border-top:2px solid var(--border); }
+  table.matrix tr.veh-total td.sticky { z-index:3; }
   table.matrix tr.veh:hover td.has { background:var(--tint,var(--panel2)); }
   table.matrix tr.veh.veh-withdrawn td,
   table.matrix tr.veh.veh-withdrawn td.sticky,
@@ -275,6 +278,7 @@
   .daily-chips { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 8px; }
   .daily-chips span { background:var(--panel2); border:1px solid var(--border); border-radius:999px;
         padding:3px 10px; font-size:12px; color:var(--muted); }
+  .daily-none { margin:0 0 12px; font-weight:700; }
   .daily-group { margin:0 0 12px; }
   .daily-group > h3 { margin:0 0 6px; font-size:17px; }
   table.stats tr.daily-implied td { background:var(--panel2); color:var(--muted); }
@@ -358,6 +362,24 @@
   .pearl-stop.used .pearl-lab { font-weight:700; }
   .pearl-stop.used-line .pearl-lab { text-decoration:underline; }
   .pearl-stop.pass .pearl-lab { font-style:italic; color:var(--muted); }
+
+  /* ---- Gesuchte Wagen ---- */
+  .wanted-chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .wanted-chip { background:var(--panel2); color:var(--muted); border:1px solid var(--border);
+        border-radius:999px; padding:6px 12px; font:inherit; font-weight:600; cursor:pointer; }
+  .wanted-chip span { font-weight:400; opacity:.8; }
+  .wanted-chip.on { background:var(--accent); color:var(--accent-fg); border-color:var(--accent); }
+  #wantedFind { font-size:18px; padding:6px 10px; width:12em; max-width:100%; }
+  .wanted-cls { margin:14px 0 22px; }
+  .wanted-head { margin:0 0 10px; font-size:20px; }
+  .wanted-head .muted { font-size:14px; font-weight:400; margin-left:6px; }
+  .wanted-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(6.2em,1fr)); gap:8px; }
+  .wanted-num { display:flex; align-items:center; justify-content:center; text-align:center;
+        background:var(--panel); border:1px solid var(--border); border-radius:10px;
+        box-shadow:var(--shadow); padding:10px 6px; font-size:30px; font-weight:800;
+        line-height:1.1; letter-spacing:.01em; font-variant-numeric:tabular-nums;
+        overflow-wrap:anywhere; }
+  .wanted-done { font-size:18px; font-weight:700; color:var(--neg); margin:0; }
 
   /* ---- Mobile: Sidebar wird zur oberen Leiste ---- */
   .navtoggle { display:none; }

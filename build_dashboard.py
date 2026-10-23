@@ -1448,6 +1448,7 @@ def build_data(statuses, stations, ignore_plus=False, loc_class_families=None,
                 ),
                 "points": points,
                 "body": status.get("body") or "",
+                "createdAt": status.get("createdAt") or None,
                 "stopovers": detail,
             }
         )
@@ -2270,6 +2271,7 @@ _JS_FILES = (
     "js/map.js",
     "js/trips.js",
     "js/vehicles.js",
+    "js/wanted.js",
     "js/lines.js",
     "js/daily.js",
 )

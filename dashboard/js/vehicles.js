@@ -285,6 +285,44 @@
     const op=lineOperator(key);
     return op?name+" ("+op+")":name;
   }
+  /**
+   * Basis für die Linien-Prozente je Baureihe: nicht ausgemusterte Nummern
+   * aus dem Fuhrpark, ohne Fuhrpark alle bisher gefundenen Fahrzeuge (ohne Filter).
+   */
+  function fleetBase(locClass, found){
+    const list=rosterList(locClass);
+    if(list) return new Set(list.filter(v=>!v.withdrawn).map(v=>normKey(v.number)));
+    return found.get(locClass)||new Set();
+  }
+  /** Gesamt-Zeile: Zeitraum, Fahrten, km und je Linie Anteil der Basis. */
+  function groupTotal(recs, lines, found){
+    const ds=recs.map(r=>r.date).filter(Boolean).sort();
+    const bases=new Map();
+    recs.forEach(r=>{
+      const loc=r.locClass||"";
+      if(!bases.has(loc)) bases.set(loc, fleetBase(loc, found));
+    });
+    let total=0;
+    bases.forEach(b=>{ total+=b.size; });
+    const perLine=new Map();
+    lines.forEach(l=>{
+      const hit=new Set();
+      recs.forEach(r=>{
+        if(r.line!==l) return;
+        const loc=r.locClass||"", key=normKey(r.vehicleNumber);
+        if(bases.get(loc).has(key)) hit.add(loc+"|"+key);
+      });
+      perLine.set(l, total
+        ? {hit:hit.size, total, pct:Math.round(100*hit.size/total)}
+        : null);
+    });
+    return {
+      first:ds[0]||"", last:ds[ds.length-1]||"", count:recs.length,
+      km:Math.round(recs.reduce((s,r)=>s+(r.distanceKm||0),0)*10)/10,
+      perLine,
+    };
+  }
+  function pctText(p){ return p?p.pct+" %":""; }
   function groupTitle(name, nVeh, nRides, km, coverage){
     let title=name+" · "+nVeh+" "+(nVeh===1?"Fahrzeug":"Fahrzeuge")+
       " · ×"+nRides+" · "+km+" km";
@@ -351,6 +389,12 @@
       });
     }
     const showClass=groupDim!=="locClass";
+    const found=new Map();
+    V.forEach(r=>{
+      const loc=r.locClass||"";
+      if(!found.has(loc)) found.set(loc,new Set());
+      found.get(loc).add(normKey(r.vehicleNumber));
+    });
     const groups=[];
     let totalVeh=0;
     [...buckets.keys()].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})).forEach(gname=>{
@@ -408,6 +452,7 @@
         name:gname,
         title:groupTitle(gname, ridden, recs.length, groupKm, coverage),
         lines, rows:visible, km:groupKm,
+        total:groupTotal(recs, lines, found),
         roster:groupDim==="locClass"&&!!rosterList(gname),
       });
     });
@@ -448,6 +493,17 @@
         });
         lines.push(cells.map(tsvCell).join("\t"));
       });
+      const t=g.total;
+      const cells=["Gesamt"];
+      if(view.showClass) cells.push(TSV_EMPTY);
+      if(showRetired) cells.push(TSV_EMPTY);
+      cells.push(t.first?fmtDate(t.first):TSV_EMPTY, t.last?fmtDate(t.last):TSV_EMPTY,
+        t.count, t.km);
+      g.lines.forEach(l=>{
+        const p=t.perLine.get(l);
+        cells.push(p?p.pct+" % ("+p.hit+"/"+p.total+")":TSV_EMPTY);
+      });
+      lines.push(cells.map(tsvCell).join("\t"));
       return lines.join("\n");
     }).join("\n\n");
   }
@@ -506,8 +562,20 @@
           <td class="lbl">${row.last?fmtDate(row.last):"—"}</td>
           ${cells}</tr>`;
       }).join("");
+      const t=g.total;
+      const foot=`<tr class="veh-total">
+        <td class="sticky lbl">Gesamt <span class="muted veh-stats">×${t.count} · ${t.km} km</span></td>
+        ${showClass?'<td class="lbl"></td>':''}
+        <td class="lbl">${t.first?fmtDate(t.first):"—"}</td>
+        <td class="lbl">${t.last?fmtDate(t.last):"—"}</td>
+        ${lines.map(l=>{
+          const p=t.perLine.get(l);
+          return p?`<td title="${p.hit} von ${p.total} Fahrzeugen">${pctText(p)}</td>`:"<td></td>";
+        }).join("")}
+      </tr>`;
       html+=`<div class="matrix-wrap"><h3>${esc(g.title)}</h3>`+
-        `<div class="matrix-scroll"><table class="matrix"><thead>${head}</thead><tbody>${body}</tbody></table></div></div>`;
+        `<div class="matrix-scroll"><table class="matrix"><thead>${head}</thead><tbody>${body}</tbody>`+
+        `<tfoot>${foot}</tfoot></table></div></div>`;
     });
     container.innerHTML=html;
     countEl.textContent=view.totalVeh+" Fahrzeuge · "+view.filtered.length+" Fahrten";
