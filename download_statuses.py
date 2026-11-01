@@ -148,8 +148,25 @@ def get_username(token):
     return username
 
 
+def local_day(ts):
+    """'YYYY-MM-DD' eines ISO-Zeitstempels in lokaler Zeit, sonst None.
+
+    Die API liefert UTC; ohne Umrechnung landen späte Fahrten am Vortag bzw.
+    frühe am Folgetag. Zeitstempel ohne Zone gelten als lokal.
+    """
+    if not isinstance(ts, str) or len(ts) < 10:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ts[:10]
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.date().isoformat()
+
+
 def status_date(status):
-    """Maßgebliches Datum eines Status als 'YYYY-MM-DD'-String.
+    """Maßgebliches Datum eines Status als lokaler 'YYYY-MM-DD'-String.
 
     Nutzt die tatsächliche Abfahrt (`checkin.origin.departure`) und fällt auf
     `departurePlanned` bzw. `createdAt` zurück, wenn diese fehlt (z. B. alte,
@@ -162,7 +179,7 @@ def status_date(status):
         or origin.get("departurePlanned")
         or status.get("createdAt")
     )
-    return ts[:10] if isinstance(ts, str) and len(ts) >= 10 else None
+    return local_day(ts)
 
 
 def status_sort_time(status):

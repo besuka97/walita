@@ -164,8 +164,15 @@ def parse_dt(value):
         return None
 
 
+def local_dt(dt):
+    """datetime in lokaler Zeit; ohne Zone gilt es schon als lokal."""
+    return dt.astimezone() if dt is not None and dt.tzinfo is not None else dt
+
+
 def trip_datetime(status):
     """Liefert (datetime|None, raw_iso) für den Reisezeitpunkt eines Status.
+
+    Das datetime ist lokal, damit Datum und Wochentag zur Ortszeit passen.
 
     Reihenfolge: departureReal → manualDeparture → departurePlanned → createdAt.
     HAFAS liefert gelegentlich geplante Zeiten ein Jahr in der Zukunft; weicht der
@@ -188,8 +195,8 @@ def trip_datetime(status):
             continue
         if created_dt and (dt.date() - created_dt.date()).days > 2:
             continue
-        return dt, raw
-    return created_dt, created_raw
+        return local_dt(dt), raw
+    return local_dt(created_dt), created_raw
 
 
 def delay_minutes(planned, real):
@@ -602,7 +609,10 @@ def cover_directed_paths(edge_counts, name_of, seq_counts=None):
 
     An Verzweigungen gewinnt die Folge, die am oftsten hintereinander befahren
     wurde (A→B→C häufiger als A→B→D). Bei gleicher Folgehäufigkeit der längere
-    Restweg. Unverzweigte Ketten werden mitgenommen. Unmittelbare Gegenkante
+    Restweg. Unverzweigte Ketten werden mitgenommen. Eine nie befahrene Folge
+    ist ausgeschlossen, solange die Kante noch in einer befahrenen Folge mit
+    einer freien Kante steckt (die befahrene Folge geht vor, auch wenn der Weg
+    dadurch kürzer wird). Unmittelbare Gegenkante
     (nach A→B nicht B→A) ist unzulässig; Stationen dürfen sonst wieder
     vorkommen (Rundfahrt). Kanten auf dem aktuellen Pfad nicht wiederholen.
     `edge_counts`: {(a_id, b_id): count}. `seq_counts`: {(a, b, c): count}.
@@ -611,6 +621,13 @@ def cover_directed_paths(edge_counts, name_of, seq_counts=None):
     unused = dict(edge_counts)
     seq = seq_counts or {}
     routes = []
+    # Kante -> Nachbarn, mit denen sie in einer befahrenen Folge steht.
+    seq_next = {}  # (a, b) -> {c}
+    seq_prev = {}  # (b, c) -> {a}
+    for (a, b, c), n in seq.items():
+        if n > 0:
+            seq_next.setdefault((a, b), set()).add(c)
+            seq_prev.setdefault((b, c), set()).add(a)
 
     def adj():
         fwd, rev = {}, {}
@@ -640,6 +657,15 @@ def cover_directed_paths(edge_counts, name_of, seq_counts=None):
         dfs(start, prev, 0, used_edges)
         return best
 
+    def reserved(u, v, forward, used_edges):
+        """Kante u–v steckt in einer befahrenen Folge über u mit freier Kante."""
+        def free(edge):
+            return edge in unused and edge not in used_edges
+
+        if forward:
+            return any(free((x, u)) for x in seq_prev.get((u, v), ()))
+        return any(free((u, y)) for y in seq_next.get((v, u), ()))
+
     def pick_hop(path, used_edges, forward, fwd, rev):
         if forward:
             u = path[-1]
@@ -656,6 +682,10 @@ def cover_directed_paths(edge_counts, name_of, seq_counts=None):
             edge = path_edge(u, v, forward)
             if edge in used_edges or edge not in unused:
                 continue
+            if pred is not None:
+                triple = (pred, u, v) if forward else (v, u, pred)
+                if not seq.get(triple, 0) and reserved(u, v, forward, used_edges):
+                    continue
             cands.append(v)
         if not cands:
             return None
@@ -929,7 +959,7 @@ def build_data(statuses, stations, ignore_plus=False, loc_class_families=None,
     Kartenfilter (nur Familien mit mindestens einem Treffer in den Daten).
     `edge_patches`: optionale Default-/Override-Via-Stationen (siehe
     edge_patches.py); fehlend = keine Expansion.
-    `station_patches`: optionale Koordinaten-Moves und ID-Merges (siehe
+    `station_patches`: optionale Koordinaten-Moves, ID-Merges und Splits (siehe
     station_patches.py); werden vor traveled_stopovers / Edge-Patches angewandt.
     `line_color_patches`: optionale routeColor-Overrides je Status (siehe
     line_color_patches.py); gelten vor der Linienfarben-Sammlung.
@@ -939,7 +969,7 @@ def build_data(statuses, stations, ignore_plus=False, loc_class_families=None,
     hier übergebenen Statuses gelernt.
     """
     sp = station_patches or {}
-    if (sp.get("moves") or sp.get("merges")):
+    if sp.get("moves") or sp.get("merges") or sp.get("splits"):
         stations, statuses, edge_patches = apply_station_patches(
             station_patches, stations, statuses, edge_patches
         )
@@ -1422,7 +1452,7 @@ def build_data(statuses, stations, ignore_plus=False, loc_class_families=None,
         )
         trips.append(
             {
-                "date": dep,
+                "date": dt.isoformat() if dt else dep,
                 "line": lk,
                 "operator": operator,
                 "category": checkin.get("category") or "",
@@ -2268,11 +2298,13 @@ _JS_FILES = (
     "js/tabs.js",
     "js/overview.js",
     "js/stats.js",
+    "js/lens.js",
     "js/map.js",
     "js/trips.js",
     "js/vehicles.js",
     "js/wanted.js",
     "js/lines.js",
+    "js/linedetail.js",
     "js/daily.js",
 )
 
@@ -2429,9 +2461,10 @@ def main(argv=None):
     station_patches = load_station_patches(args.station_patches)
     n_move = len(station_patches.get("moves") or {})
     n_merge = len(station_patches.get("merges") or {})
-    if n_move or n_merge:
-        log(f"Stations-Patches: {n_move} Verschiebungen, {n_merge} Merges "
-            f"aus {args.station_patches}.")
+    n_split = len(station_patches.get("splits") or {})
+    if n_move or n_merge or n_split:
+        log(f"Stations-Patches: {n_move} Verschiebungen, {n_merge} Merges, "
+            f"{n_split} Aufteilungen aus {args.station_patches}.")
     elif os.path.isfile(args.station_patches):
         log(f"Stations-Patches: {args.station_patches} ist leer.")
 
@@ -2492,7 +2525,8 @@ def main(argv=None):
 
     # Stations-Patches einmal für alle Läufe; build_data bekommt die
     # gepatchten Kopien und keine Stations-Patches mehr.
-    if station_patches.get("moves") or station_patches.get("merges"):
+    if (station_patches.get("moves") or station_patches.get("merges")
+            or station_patches.get("splits")):
         stations, statuses, edge_patches = apply_station_patches(
             station_patches, stations, statuses, edge_patches
         )

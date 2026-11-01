@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 besuka97
-"""Lokale Stations-Patches: Koordinaten verschieben und Stationen mergen.
+"""Lokale Stations-Patches: Koordinaten verschieben, Stationen mergen und aufteilen.
 
 Kein API-Write. Die Datei (Default `data/station_patches.json`) liegt vor den
 Kanten-Patches: Moves überschreiben Lat/Lon, Merges schreiben IDs auf den
-Survivor um. Quelle `stations.json` / `statuses.json` bleibt unangetastet.
+Survivor um, Splits schreiben einen Halt auf eine andere Station um, wenn sein
+Nachbar im Laufweg passt (Träwelling fasst getrennte Stationen zusammen).
+Quelle `stations.json` / `statuses.json` bleibt unangetastet.
 """
 
 import json
@@ -18,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from edge_patches import (
     add_seen,
+    consecutive_pairs,
     seen_dates,
     lookup_station,
     search_stations,
@@ -28,7 +31,7 @@ from edge_patches import (
 
 
 def empty_patches():
-    return {"moves": {}, "merges": {}}
+    return {"moves": {}, "merges": {}, "splits": {}}
 
 
 def _parse_coord_pair(lat, lon):
@@ -48,6 +51,7 @@ def load_patches(path):
 
     moves: id -> (lat, lon)
     merges: from_id -> to_id
+    splits: (station_id, neighbor_id) -> to_id
     """
     if not path or not os.path.isfile(path):
         return empty_patches()
@@ -75,7 +79,22 @@ def load_patches(path):
         if src is None or dest is None or src == dest:
             continue
         merges[src] = dest
-    return {"moves": moves, "merges": merges}
+    splits = {}
+    for row in data.get("splits") or []:
+        if not isinstance(row, dict):
+            continue
+        key = _split_key(row.get("station"), row.get("neighbor"), row.get("to"))
+        if key is not None:
+            splits[key[:2]] = key[2]
+    return {"moves": moves, "merges": merges, "splits": splits}
+
+
+def _split_key(station, neighbor, to):
+    """(Station, Nachbar, Ersatz) normalisiert oder None, wenn nicht drei verschiedene."""
+    ids = (station_id(station), station_id(neighbor), station_id(to))
+    if None in ids or len(set(ids)) < 3:
+        return None
+    return ids
 
 
 def dumps_patches(patches):
@@ -89,7 +108,12 @@ def dumps_patches(patches):
         (patches.get("merges") or {}).items(), key=lambda kv: (kv[0], kv[1])
     ):
         merges.append({"from": src, "to": dest})
-    return {"moves": moves, "merges": merges}
+    splits = []
+    for (sid, nb), dest in sorted(
+        (patches.get("splits") or {}).items(), key=lambda kv: (str(kv[0]), str(kv[1]))
+    ):
+        splits.append({"station": sid, "neighbor": nb, "to": dest})
+    return {"moves": moves, "merges": merges, "splits": splits}
 
 
 def save_patches(path, patches):
@@ -198,18 +222,34 @@ def _remap_stop(obj, aliases, stations):
     out = dict(obj)
     sid = station_id(out.get("id"))
     if sid in aliases:
-        dest = aliases[sid]
-        out["id"] = dest
-        st = lookup_station(stations, dest) or {}
-        if st.get("name"):
-            out["name"] = st["name"]
-        lat, lon = st.get("latitude"), st.get("longitude")
-        if lat is not None and lon is not None:
-            out["latitude"] = lat
-            out["longitude"] = lon
+        _set_station(out, aliases[sid], stations)
     nested = out.get("station")
     if isinstance(nested, dict):
         out["station"] = _remap_stop(nested, aliases, stations)
+    return out
+
+
+def _set_station(out, dest, stations):
+    """Setzt ID, Name und Koordinaten von `dest` in den Halt-Dict `out`."""
+    out["id"] = dest
+    st = lookup_station(stations, dest) or {}
+    if st.get("name"):
+        out["name"] = st["name"]
+    lat, lon = st.get("latitude"), st.get("longitude")
+    if lat is not None and lon is not None:
+        out["latitude"] = lat
+        out["longitude"] = lon
+
+
+def _replace_stop(obj, dest, stations):
+    """Kopie des Halts (und seiner verschachtelten Station) auf Station `dest`."""
+    out = dict(obj)
+    _set_station(out, dest, stations)
+    nested = out.get("station")
+    if isinstance(nested, dict):
+        nested = dict(nested)
+        _set_station(nested, dest, stations)
+        out["station"] = nested
     return out
 
 
@@ -269,6 +309,15 @@ def apply_to_edge_patches(edge_patches, aliases):
     """In-Memory-Umschlüsselung. Datei bleibt bei Original-IDs (Unmerge)."""
     if not edge_patches or not aliases:
         return edge_patches
+    return _rewrite_edge_patches(
+        edge_patches,
+        lambda a, b: (canonical_id(a, aliases), canonical_id(b, aliases)),
+        aliases,
+    )
+
+
+def _rewrite_edge_patches(edge_patches, pair_fn, aliases):
+    """Schlüssel (a, b) über `pair_fn`; unveränderte Schlüssel gewinnen."""
 
     def rewrite_map(src, key_len):
         originals = []
@@ -279,7 +328,7 @@ def apply_to_edge_patches(edge_patches, aliases):
                 extra = ()
             else:
                 extra, a, b = key[0], key[1], key[2]
-            a2, b2 = canonical_id(a, aliases), canonical_id(b, aliases)
+            a2, b2 = pair_fn(a, b)
             if a2 is None or b2 is None or a2 == b2:
                 continue
             new_key = (a2, b2) if key_len == 2 else (extra, a2, b2)
@@ -304,17 +353,154 @@ def apply_to_edge_patches(edge_patches, aliases):
     }
 
 
+def split_rules(patches, aliases=None):
+    """(Station, Nachbar) → Ersatz, alle IDs nach Merges kanonisch.
+
+    Regeln, die nach dem Merge nicht mehr drei verschiedene Stationen nennen,
+    fallen weg; kollidieren zwei, gewinnt die erste in Dateireihenfolge.
+    """
+    if aliases is None:
+        aliases = alias_map(patches or {})
+    out = {}
+    for (sid, nb), dest in ((patches or {}).get("splits") or {}).items():
+        key = _split_key(canonical_id(sid, aliases), canonical_id(nb, aliases),
+                         canonical_id(dest, aliases))
+        if key is not None and key[:2] not in out:
+            out[key[:2]] = key[2]
+    return out
+
+
+def split_targets(stops, rules):
+    """Index → Ersatz-ID für Halte, deren Nachbar im Laufweg eine Regel trifft.
+
+    Nachbarn sind die nächsten nicht entfallenen Halte davor und danach (wie
+    die Kantenbildung). Trifft der Vorgänger, gilt seine Regel.
+    """
+    stops = list(stops or [])
+    ids = [station_id(s.get("id")) if isinstance(s, dict) else None for s in stops]
+    live = [i for i, s in enumerate(stops)
+            if isinstance(s, dict) and not s.get("cancelled") and ids[i] is not None]
+    out = {}
+    if not rules:
+        return out
+    stations_with_rules = {sid for sid, _nb in rules}
+    for i, sid in enumerate(ids):
+        if sid not in stations_with_rules:
+            continue
+        prev = next((ids[j] for j in reversed(live) if j < i and ids[j] != sid), None)
+        nxt = next((ids[j] for j in live if j > i and ids[j] != sid), None)
+        dest = rules.get((sid, prev)) or rules.get((sid, nxt))
+        if dest is not None:
+            out[i] = dest
+    return out
+
+
+def _boundary_indices(checkin, stops):
+    """Indizes von Start und Ziel in `stops` (Logik wie traveled_stopovers)."""
+    def by_stopover(stop):
+        so = (stop or {}).get("stopoverId")
+        if so is None:
+            return None
+        return next((i for i, s in enumerate(stops) if s.get("stopoverId") == so), None)
+
+    def by_station(stop, after=-1):
+        sid = station_id((stop or {}).get("id"))
+        if sid is None:
+            return None
+        return next((i for i, s in enumerate(stops)
+                     if i > after and station_id(s.get("id")) == sid), None)
+
+    origin, dest = checkin.get("origin"), checkin.get("destination")
+    i_start = by_stopover(origin)
+    if i_start is None:
+        i_start = by_station(origin)
+    i_end = by_stopover(dest)
+    if i_end is None:
+        i_end = by_station(dest, -1 if i_start is None else i_start)
+    return i_start, i_end
+
+
+def apply_splits_to_statuses(statuses, rules, stations):
+    """Halte mit passendem Nachbarn auf die Ersatz-Station. Mutiert nicht.
+
+    Umgeschrieben wird der ganze Halt, also beide angrenzenden Kanten. Start
+    und Ziel des Check-ins folgen ihrem Halt im Trip; ohne Trip ist das
+    jeweils andere Ende der Nachbar.
+    """
+    if not statuses or not rules:
+        return statuses
+    out = []
+    for status in statuses:
+        if not isinstance(status, dict):
+            out.append(status)
+            continue
+        checkin = status.get("checkin")
+        checkin = checkin if isinstance(checkin, dict) else {}
+        trip = status.get("trip")
+        stops = (trip.get("stopovers") or []) if isinstance(trip, dict) else []
+        ends = {}
+        item = status
+        if stops:
+            targets = split_targets(stops, rules)
+            if targets:
+                trip = dict(trip)
+                trip["stopovers"] = [
+                    _replace_stop(s, targets[i], stations) if i in targets else s
+                    for i, s in enumerate(stops)
+                ]
+                item = dict(status)
+                item["trip"] = trip
+                i_start, i_end = _boundary_indices(checkin, stops)
+                if i_start in targets:
+                    ends["origin"] = targets[i_start]
+                if i_end in targets:
+                    ends["destination"] = targets[i_end]
+        else:
+            o = station_id((checkin.get("origin") or {}).get("id"))
+            d = station_id((checkin.get("destination") or {}).get("id"))
+            if (o, d) in rules:
+                ends["origin"] = rules[(o, d)]
+            if (d, o) in rules:
+                ends["destination"] = rules[(d, o)]
+        if ends:
+            checkin = dict(checkin)
+            for role, dest in ends.items():
+                if isinstance(checkin.get(role), dict):
+                    checkin[role] = _replace_stop(checkin[role], dest, stations)
+            if item is status:
+                item = dict(status)
+            item["checkin"] = checkin
+        out.append(item)
+    return out
+
+
+def apply_splits_to_edge_patches(edge_patches, rules):
+    """Kanten-Patches auf W–N wandern nach R–N (beide Richtungen), nur im Speicher."""
+    if not edge_patches or not rules:
+        return edge_patches
+    return _rewrite_edge_patches(
+        edge_patches,
+        lambda a, b: (rules.get((a, b), a), rules.get((b, a), b)),
+        {},
+    )
+
+
 def apply_station_patches(patches, stations, statuses=None, edge_patches=None):
-    """Kopien: Moves/Merges anwenden. Mutiert die Eingaben nicht."""
+    """Kopien: Moves/Merges, dann Splits anwenden. Mutiert die Eingaben nicht."""
     patches = patches or empty_patches()
     stations_out = apply_to_stations(patches, stations)
     aliases = alias_map(patches)
+    rules = split_rules(patches, aliases)
     statuses_out = statuses
     if statuses is not None and aliases:
         statuses_out = apply_to_statuses(statuses, aliases, stations_out)
+    if statuses_out is not None and rules:
+        statuses_out = apply_splits_to_statuses(statuses_out, rules, stations_out)
     edge_out = edge_patches
     if edge_patches is not None and aliases:
         edge_out = apply_to_edge_patches(edge_patches, aliases)
+    if edge_out is not None and rules:
+        edge_out = apply_splits_to_edge_patches(edge_out, rules)
     return stations_out, statuses_out, edge_out
 
 
@@ -358,6 +544,8 @@ def collect_used_ids(statuses, edge_patches=None, station_patches=None):
     for src, dest in (sp.get("merges") or {}).items():
         ids.add(src)
         ids.add(dest)
+    for (sid, nb), dest in (sp.get("splits") or {}).items():
+        ids.update((sid, nb, dest))
     ids.discard(None)
     return ids
 
@@ -399,6 +587,40 @@ def set_merge(patches, from_id, to_id):
 
 def clear_merge(patches, from_id):
     (patches.get("merges") or {}).pop(station_id(from_id), None)
+
+
+def set_split(patches, station, neighbor, to):
+    """Halt `station` neben `neighbor` wird zu `to`. False wenn ungültig."""
+    key = _split_key(station, neighbor, to)
+    if key is None:
+        return False
+    patches.setdefault("splits", {})[key[:2]] = key[2]
+    return True
+
+
+def clear_split(patches, station, neighbor):
+    (patches.get("splits") or {}).pop((station_id(station), station_id(neighbor)), None)
+
+
+def neighbor_counts(statuses, sid):
+    """Nachbar-ID → Anzahl Kanten (beide Richtungen) an `sid` in allen Trips."""
+    sid = station_id(sid)
+    counts = {}
+    for status in statuses or []:
+        if not isinstance(status, dict):
+            continue
+        stops = (status.get("trip") or {}).get("stopovers") or []
+        if not stops:
+            checkin = status.get("checkin") or {}
+            stops = [s for s in (checkin.get("origin"), checkin.get("destination"))
+                     if isinstance(s, dict)]
+        for a, b in consecutive_pairs(stops):
+            a_id, b_id = station_id(a.get("id")), station_id(b.get("id"))
+            if a_id == sid:
+                counts[b_id] = counts.get(b_id, 0) + 1
+            elif b_id == sid:
+                counts[a_id] = counts.get(a_id, 0) + 1
+    return counts
 
 
 PATCH_MAP_PORT = 8712
@@ -446,6 +668,11 @@ class StationMapService:
             self.statuses = list(statuses or [])
             self.seen_days = seen_dates(self.statuses)
             self.edge_patches = edge_patches or {"defaults": {}, "overrides": {}}
+            self.patches = patches or empty_patches()
+
+    def set_patches(self, patches):
+        """Stand nach einer Änderung im Editor, damit Saves ihn nicht verlieren."""
+        with self._lock:
             self.patches = patches or empty_patches()
 
     def _snapshot(self):

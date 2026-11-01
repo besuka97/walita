@@ -208,13 +208,25 @@ let map=null, mapBounds=[], mapFitted=false;
   // keines von beiden gesetzt ist, filtert das Jahr-Dropdown per Präfix.
   function matchesVar(vi){
     const v=VAR[vi]; if(!v) return false;
-    const date=v[4]||"";
+    return matchesAttrs(v[0], v[1], v[2], v[3], v[4]||"");
+  }
+  function matchesAttrs(line, loc, cat, op, date){
     const from=dateFromEl.value, to=dateToEl.value;
     const ranged=!!(from||to);
     const yearOk=ranged ? true : sel(yearEl.value, date.slice(0,4));
     const dateOk=(!from || date>=from) && (!to || date<=to);
-    return sel(lineEl.value, v[0]) && selLoc(locEl.value, v[1])
-        && sel(catEl.value, v[2]) && sel(opEl.value, v[3]) && yearOk && dateOk;
+    return sel(lineEl.value, line) && selLoc(locEl.value, loc)
+        && sel(catEl.value, cat) && sel(opEl.value, op) && yearOk && dateOk;
+  }
+  // Dieselben Filter auf eine Fahrt (trips[]) angewendet, für die Lupe.
+  function matchesTrip(t){
+    if(!matchesAttrs(t.line||"", t.locClass||"", t.category||"", t.operator||"", statsYmd(t))) return false;
+    const want=vehEl.value;
+    if(want==="__all__") return true;
+    const nums=String(t.vehicles||"").split(",").map(s=>s.trim()).filter(Boolean);
+    if(want==="__none__") return !nums.length;
+    const v=VEH[+want];
+    return !!v && v[0]===(t.locClass||"") && nums.indexOf(v[1])>=0;
   }
   function matchesVeh(vehIdx){
     const want=vehEl.value;
@@ -369,7 +381,7 @@ let map=null, mapBounds=[], mapFitted=false;
         const s=ST[sid]; if(!s) return;
         const cur=nm.get(sid);
         if(cur){ cur.count+=cnt; cur.usedCount+=used; cur.heldCount+=held; cur.passCount+=passed; }
-        else nm.set(sid,{lat:s[0],lon:s[1],name:s[2],count:cnt,usedCount:used,heldCount:held,passCount:passed});
+        else nm.set(sid,{sid:String(sid),lat:s[0],lon:s[1],name:s[2],count:cnt,usedCount:used,heldCount:held,passCount:passed});
       });
     } else {
       rawNodes.forEach(row=>{
@@ -379,7 +391,7 @@ let map=null, mapBounds=[], mapFitted=false;
         const cnt=row[2], used=row[3]||0, held=row[4]||0, passed=row[5]||0;
         const cur=nm.get(sid);
         if(cur){ cur.count+=cnt; cur.usedCount+=used; cur.heldCount+=held; cur.passCount+=passed; }
-        else nm.set(sid,{lat:s[0],lon:s[1],name:s[2],count:cnt,usedCount:used,heldCount:held,passCount:passed});
+        else nm.set(sid,{sid:String(sid),lat:s[0],lon:s[1],name:s[2],count:cnt,usedCount:used,heldCount:held,passCount:passed});
       });
     }
     vNodes=[...nm.values()];
@@ -484,6 +496,7 @@ let map=null, mapBounds=[], mapFitted=false;
   // optisch oben und gewinnen den Hit-Test nur punktgenau; Klicks auf die Linie
   // dazwischen treffen die Kante.
   const overlay=L.layerGroup().addTo(map);
+  const mapEl=map.getContainer();
   function px(latlng){ return map.latLngToLayerPoint(latlng); }
   function ll(pt){ return map.layerPointToLatLng(pt); }
   function edgeGeom(e, weight){
@@ -1159,10 +1172,52 @@ let map=null, mapBounds=[], mapFitted=false;
         color:heldOnly?"#000":(used?"#1e293b":"#33475b"),
         weight:heldOnly?1.5:(used?2:1),
         fillColor:heldOnly?"#fff":col,
-        fillOpacity:heldOnly?1:(used?.95:.75)})
-        .bindPopup(`<b>${esc(n.name)}</b><br>`+parts.join("<br>")).addTo(overlay);
+        fillOpacity:heldOnly?1:(used?.95:.75), bubblingMouseEvents:false})
+        .bindTooltip(`<b>${esc(n.name)}</b><br>`+parts.join("<br>"))
+        .on("click", ()=>openLens(n.sid)).addTo(overlay);
     });
   }
+
+  // Lupe an einer Station: Fahrtbeziehungen der Fahrten, die den aktuellen
+  // Filtern entsprechen; Arme in geografischer Richtung der Nachbarn.
+  function lensRides(){
+    const src=D();
+    const T=src.trips||[], E=src.statEdges||[], S=src.statStops||[];
+    const out=[];
+    T.forEach((t,i)=>{ if(matchesTrip(t)) out.push({t, i, day:statsYmd(t), edges:E[i]||[], stops:S[i]||[]}); });
+    return out;
+  }
+  function lensColor(line){
+    const c=LCOL[line];
+    if(c && c[0]) return c[0];
+    if(isLineMode()){ const gid=GROUPS.indexOf(line); if(gid>=0) return groupColor(gid).bg; }
+    return "#3d5a80";
+  }
+  function openLens(sid){
+    const s=ST[sid]; if(!s) return;
+    const T=D().trips||[];
+    const list=lensRides();
+    const at=L.latLng(s[0], s[1]);
+    const el=lens.open({
+      sid, list, parent:mapEl,
+      byLine:lineEl.value==="__all__" || lineEl.value==="__none__",
+      joins:y=>matchesTrip(T[y]),
+      dirs:nb=>{
+        const q=ST[nb]; if(!q) return [1,0];
+        const a=map.project(at), b=map.project(L.latLng(q[0], q[1]));
+        const dx=b.x-a.x, dy=b.y-a.y, l=Math.hypot(dx,dy)||1;
+        return [dx/l, dy/l];
+      },
+      colorOf:m=>lensColor(m.line||(list[0]&&list[0].t.line)||""),
+      target:{getBoundingClientRect(){
+        const r=mapEl.getBoundingClientRect(), p=map.latLngToContainerPoint(at);
+        return {left:r.left+p.x, top:r.top+p.y, width:0, height:0};
+      }},
+    });
+    L.DomEvent.disableClickPropagation(el);
+    L.DomEvent.disableScrollPropagation(el);
+  }
+  function lensOnMap(){ const el=lens.element(); return !!el && mapEl.contains(el); }
 
   let legendDiv=null;
   function updateLegend(){
@@ -1214,13 +1269,16 @@ let map=null, mapBounds=[], mapFitted=false;
   drawAll();
   onHomeChange(()=>{ applyScope(); drawAll(); });
   map.on("moveend", draw);
+  // Lupe folgt der Station und den Filtern.
+  function refreshLens(){ if(lensOnMap()) openLens(lens.sid()); }
+  map.on("move zoom", ()=>{ if(lensOnMap()) lens.place(); });
+  map.on("click", ()=>{ if(lensOnMap()) lens.close(); });
+  onHomeChange(()=>{ if(lensOnMap()) lens.close(); });
   [modeEl,lineEl,locEl,vehEl,catEl,opEl,yearEl,dateFromEl,dateToEl,discEl].forEach(el=>{
     if(!el) return;
-    el.onchange=drawAll;
-    if(el===dateFromEl||el===dateToEl) el.oninput=drawAll;
+    el.onchange=()=>{ drawAll(); refreshLens(); };
+    if(el===dateFromEl||el===dateToEl) el.oninput=el.onchange;
   });
-
-  const mapEl=map.getContainer();
   const FS_ENTER='<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM4 15h2v3h3v2H4v-5zm13 3v-3h2v5h-5v-2h3z"/></svg>';
   const FS_EXIT='<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M9 4H7v3H4v2h5V4zm8 0h-2v5h5V7h-3V4zM4 15v2h3v3h2v-5H4zm11 2h5v-2h-5v5h2v-3z"/></svg>';
   const fsCtrl=L.control({position:"topleft"});

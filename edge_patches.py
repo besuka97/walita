@@ -7,6 +7,7 @@ Kein API-Write. Die Datei (Default `data/edge_patches.json`) splittet grobe
 Träwelling-Kanten (A→B) in topologische Teilstücke A→…→B.
 """
 
+import datetime
 import json
 import math
 import os
@@ -272,7 +273,7 @@ def station_map_row(stations, sid, from_id=None, to_id=None):
 
 
 def _status_day(status):
-    """'YYYY-MM-DD' der Abfahrt am Einstieg (wie `status_date` im Export)."""
+    """Lokales 'YYYY-MM-DD' der Abfahrt am Einstieg (wie `status_date` im Export)."""
     checkin = status.get("checkin") or {}
     origin = checkin.get("origin") or {}
     ts = (
@@ -280,7 +281,15 @@ def _status_day(status):
         or origin.get("departurePlanned")
         or status.get("createdAt")
     )
-    return ts[:10] if isinstance(ts, str) and len(ts) >= 10 else None
+    if not isinstance(ts, str) or len(ts) < 10:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ts[:10]
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.date().isoformat()
 
 
 def seen_dates(statuses):

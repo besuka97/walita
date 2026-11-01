@@ -1207,7 +1207,7 @@ def station_label(stations, sid):
 
 def status_label(status):
     checkin = (status or {}).get("checkin") or {}
-    dep = ((checkin.get("origin") or {}).get("departurePlanned") or "")[:10]
+    dep = dl.local_day((checkin.get("origin") or {}).get("departurePlanned")) or ""
     day = ".".join(reversed(dep.split("-"))) if dep else ""
     return "%s %s %s → %s" % (
         day, checkin.get("lineName") or "",
@@ -1569,6 +1569,175 @@ class EdgesPage(_GroupedPage):
             self.ctx.open_edge_map(parts[1], parts[2], parts[0])
 
 
+_LABEL_ID = re.compile(r"\((-?\d+)\)(?:\s*·.*)?$")
+
+
+def parse_station_ref(text):
+    """ID aus „Name (123) · …“ oder einer bloßen Zahl, sonst None."""
+    text = (text or "").strip()
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+    m = _LABEL_ID.search(text)
+    return int(m.group(1)) if m else None
+
+
+SPLIT_NEAR_KM = 3.0
+
+
+class SplitDialog(tk.Toplevel):
+    """Aufteilung anlegen: falsche Station, Nachbar, richtige Station.
+
+    `edge` (a, b) beschränkt die falsche Station auf die Kantenenden; das
+    andere Ende wird Nachbar. result = (station, neighbor, to) oder None.
+    """
+
+    def __init__(self, master, stations, statuses, station=None, neighbor=None,
+                 to=None, edge=None):
+        super().__init__(master)
+        self.title("Station aufteilen")
+        self.transient(master)
+        self.resizable(False, False)
+        self.stations = stations
+        self.statuses = statuses
+        self.edge = tuple(edge) if edge else None
+        self.result = None
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame, wraplength=520, justify="left",
+            text="Halte der falschen Station, die im Laufweg neben dem Nachbarn "
+                 "liegen, werden auf die richtige Station umgeschrieben "
+                 "(beide Richtungen, beide Kanten des Halts).",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.station_var = tk.StringVar()
+        self.neighbor_var = tk.StringVar()
+        self.to_var = tk.StringVar()
+        rows = (("Falsche Station", self.station_var),
+                ("Nachbar", self.neighbor_var),
+                ("Richtige Station (oder ID)", self.to_var))
+        self.boxes = []
+        for i, (label, var) in enumerate(rows, start=1):
+            ttk.Label(frame, text=label).grid(row=i, column=0, sticky="w", pady=3)
+            box = ttk.Combobox(frame, textvariable=var, width=52)
+            box.grid(row=i, column=1, sticky="we", pady=3, padx=(8, 0))
+            self.boxes.append(box)
+        self.boxes[0].configure(values=self._station_choices())
+        self.boxes[0].bind("<<ComboboxSelected>>", lambda _e: self._station_changed())
+        self.boxes[0].bind("<FocusOut>", lambda _e: self._station_changed())
+        if station is not None:
+            self.station_var.set(station_label(stations, station))
+        self._station_changed(neighbor=neighbor)
+        if to is not None:
+            self.to_var.set(station_label(stations, to))
+        btns = ttk.Frame(frame)
+        btns.grid(row=len(rows) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="Abbrechen", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="OK", command=self._ok).pack(side="right", padx=6)
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        (self.boxes[2] if station is not None else self.boxes[0]).focus_set()
+        self.grab_set()
+        self.wait_window(self)
+
+    def _station_choices(self):
+        if self.edge:
+            return [station_label(self.stations, sid) for sid in self.edge]
+        ids = sp.collect_used_ids(self.statuses)
+        return sorted((station_label(self.stations, sid) for sid in ids),
+                      key=str.casefold)
+
+    def _station_changed(self, neighbor=None):
+        sid = parse_station_ref(self.station_var.get())
+        if sid is None:
+            return
+        counts = sp.neighbor_counts(self.statuses, sid)
+        order = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        self.boxes[1].configure(values=[
+            "%s · %d Kanten" % (station_label(self.stations, nb), n) for nb, n in order
+        ])
+        if neighbor is None and self.edge and sid in self.edge:
+            neighbor = self.edge[1] if sid == self.edge[0] else self.edge[0]
+        if neighbor is not None:
+            self.neighbor_var.set(station_label(self.stations, neighbor))
+        self.boxes[2].configure(values=self._near_choices(sid))
+
+    def _near_choices(self, sid):
+        st = _station(self.stations, sid)
+        if not isinstance(st, dict) or st.get("latitude") is None:
+            return []
+        near = []
+        for key, other in self.stations.items():
+            if not isinstance(other, dict) or other.get("latitude") is None:
+                continue
+            oid = ep.station_id(other.get("id", key))
+            if oid == sid:
+                continue
+            km = ep.haversine_km(st["latitude"], st["longitude"],
+                                 other["latitude"], other["longitude"])
+            if km <= SPLIT_NEAR_KM:
+                near.append((km, oid))
+        near.sort(key=lambda r: (r[0], str(r[1])))
+        return ["%s · %d m" % (station_label(self.stations, oid), round(km * 1000))
+                for km, oid in near]
+
+    def _ok(self):
+        ids = [parse_station_ref(v.get())
+               for v in (self.station_var, self.neighbor_var, self.to_var)]
+        if None in ids:
+            messagebox.showerror(
+                "Eingabe", "Bitte alle drei Stationen wählen oder eine ID eintragen.",
+                parent=self)
+            return
+        if len(set(ids)) < 3:
+            messagebox.showerror(
+                "Eingabe", "Falsche, Nachbar- und richtige Station müssen "
+                "verschieden sein.", parent=self)
+            return
+        self.result = tuple(ids)
+        self.destroy()
+
+
+def ask_split(master, ctx, replace=None, on_saved=None, **prefill):
+    """Dialog → Regel in station_patches.json; unbekannte Ziel-ID per API holen.
+
+    `replace` (station, neighbor) ist die bearbeitete Regel und fällt weg, wenn
+    sich ihr Schlüssel ändert. `on_saved` läuft nach dem Schreiben (auch nach
+    einem Abruf im Hintergrund).
+    """
+    path = ctx.paths["stations"]
+    err = check_config_file(path)
+    if err:
+        messagebox.showerror("Stationen", err, parent=master)
+        return False
+    stations = load_stations(ctx.stations_path)
+    dlg = SplitDialog(master, stations, ctx.statuses, **prefill)
+    if not dlg.result:
+        return
+    station, neighbor, to = dlg.result
+
+    def save():
+        patches = sp.load_patches(path)
+        if replace and tuple(replace) != (station, neighbor):
+            sp.clear_split(patches, *replace)
+        if not sp.set_split(patches, station, neighbor, to):
+            return
+        if not sp.save_patches(path, patches):
+            messagebox.showerror("Speichern", f"{path} nicht schreibbar.", parent=master)
+            return
+        fresh = load_stations(ctx.stations_path)
+        ctx.set_status("Aufteilung gespeichert: %s neben %s → %s." % (
+            station_label(fresh, station), station_label(fresh, neighbor),
+            station_label(fresh, to)))
+        ctx.after_change("StationsPage")
+        if on_saved:
+            on_saved()
+
+    if _station(stations, to) is not None:
+        save()
+    else:
+        ctx.fetch_station(to, save)
+
+
 class StationsPage(_GroupedPage):
     def __init__(self, parent, ctx):
         self.patches = sp.empty_patches()
@@ -1582,7 +1751,12 @@ class StationsPage(_GroupedPage):
         )
 
     def extra_buttons(self, frame):
+        self._btn(frame, "Aufteilung hinzufügen …", self._add_split)
         self._btn(frame, "Stationskarte öffnen", self.ctx.open_station_map, side="right")
+
+    def _add_split(self):
+        if not self.read_only:
+            ask_split(self, self.ctx, on_saved=self.reload)
 
     def load(self):
         self.patches = sp.load_patches(self.path)
@@ -1596,6 +1770,9 @@ class StationsPage(_GroupedPage):
         for src, dest in self.patches["merges"].items():
             if _station(self.stations, dest) is None:
                 bad.add("j:%d" % src)
+        for (sid, nb), dest in self.patches["splits"].items():
+            if _station(self.stations, dest) is None:
+                bad.add("s:%d:%d" % (sid, nb))
         return bad
 
     def _fill(self):
@@ -1632,10 +1809,31 @@ class StationsPage(_GroupedPage):
             iid = "j:%d" % src
             self.tree.insert("h:j", "end", iid=iid, values=vals,
                              tags=("orphan",) if iid in orphan else ())
+        self.tree.insert("", "end", iid="h:s", text="Aufteilungen", open=True)
+        for (sid, nb), dest in self._ordered(
+            self.patches["splits"].items(),
+            lambda kv: (station_label(self.stations, kv[0][0]) + " neben "
+                        + station_label(self.stations, kv[0][1]),
+                        station_label(self.stations, kv[1])),
+        ):
+            vals = (station_label(self.stations, sid) + " neben "
+                    + station_label(self.stations, nb),
+                    "→ " + station_label(self.stations, dest))
+            if q and q not in " ".join(vals).casefold():
+                continue
+            iid = "s:%d:%d" % (sid, nb)
+            self.tree.insert("h:s", "end", iid=iid, values=vals,
+                             tags=("orphan",) if iid in orphan else ())
         self.orphan_btn.configure(state="normal" if orphan else "disabled")
 
     def edit(self, iid):
-        self.ctx.open_station_map()
+        kind, _, rest = iid.partition(":")
+        if kind != "s":
+            self.ctx.open_station_map()
+            return
+        sid, nb = (int(x) for x in rest.split(":"))
+        ask_split(self, self.ctx, replace=(sid, nb), on_saved=self.reload,
+                  station=sid, neighbor=nb, to=self.patches["splits"].get((sid, nb)))
 
     def delete(self, iids):
         n = 0
@@ -1646,6 +1844,10 @@ class StationsPage(_GroupedPage):
                 n += 1
             elif kind == "j":
                 sp.clear_merge(self.patches, int(sid))
+                n += 1
+            elif kind == "s":
+                station, nb = sid.split(":")
+                sp.clear_split(self.patches, int(station), int(nb))
                 n += 1
         if not n:
             return

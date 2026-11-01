@@ -64,6 +64,17 @@
   function coverDirectedPaths(edgeMap, seqMap, nameOf){
     const unused=new Map(edgeMap);
     const routes=[];
+    // Kante -> Nachbarn, mit denen sie in einer befahrenen Folge steht.
+    const seqNext=new Map(), seqPrev=new Map();
+    for(const [key,n] of seqMap){
+      if(!(n>0)) continue;
+      const [a,b,c]=key.split("\0");
+      const kn=ek(a,b), kp=ek(b,c);
+      if(!seqNext.has(kn)) seqNext.set(kn,[]);
+      seqNext.get(kn).push(c);
+      if(!seqPrev.has(kp)) seqPrev.set(kp,[]);
+      seqPrev.get(kp).push(a);
+    }
     function adj(){
       const fwd=new Map(), rev=new Map();
       for(const e of unused.values()){
@@ -91,6 +102,12 @@
       dfs(start, prev, 0, usedEdges);
       return best;
     }
+    // Kante u–v steckt in einer befahrenen Folge über u mit freier Kante.
+    function reserved(u, v, forward, usedEdges){
+      const free=edge=>unused.has(edge)&&!usedEdges.has(edge);
+      if(forward) return (seqPrev.get(ek(u,v))||[]).some(x=>free(ek(x,u)));
+      return (seqNext.get(ek(v,u))||[]).some(y=>free(ek(u,y)));
+    }
     function pickHop(path, usedEdges, forward, fwd, rev){
       const u=forward?path[path.length-1]:path[0];
       const pred=forward
@@ -102,6 +119,10 @@
         if(pred!=null && v===pred) continue;
         const edge=pathEdge(u,v,forward);
         if(usedEdges.has(edge)||!unused.has(edge)) continue;
+        if(pred!=null){
+          const triple=forward?sk(pred,u,v):sk(v,u,pred);
+          if(!seqMap.get(triple) && reserved(u,v,forward,usedEdges)) continue;
+        }
         cands.push(v);
       }
       if(!cands.length) return null;
@@ -390,12 +411,27 @@
       bodyEl.innerHTML=`<p class="hint">${esc((D().lines||[]).length?"Keine Treffer.":"Keine Linien in den Daten.")}</p>`;
       return;
     }
-    bodyEl.innerHTML=groups.map(g=>{
+    bodyEl.innerHTML=groups.map((g,gi)=>{
       const opLabel=g.operator||"(ohne Operator)";
       const n=g.lines.length;
       const cards=g.lines.map(r=>lineCard(r)).join("");
-      return `<div class="line-op"><h3>${esc(opLabel)} <span class="muted">· ${fmtN(n)} ${n===1?"Linie":"Linien"} · ${fmtN(Math.round(g.km*10)/10)} km · ${fmtN(g.count)} Fahrten</span></h3>${cards}</div>`;
+      return `<div class="line-op"><h3>${esc(opLabel)} <span class="muted">· ${fmtN(n)} ${n===1?"Linie":"Linien"} · ${fmtN(Math.round(g.km*10)/10)} km · ${fmtN(g.count)} Fahrten</span>
+        <button type="button" class="line-card-detail line-op-detail" data-gi="${gi}" title="Detailseite mit Statistiken und Netzplan aller Linien dieses Unternehmens">Netzplan →</button></h3>${cards}</div>`;
     }).join("");
+    bodyEl.querySelectorAll(".line-op-detail").forEach(btn=>{
+      btn.addEventListener("click",()=>{
+        const g=groups[+btn.dataset.gi];
+        if(g) openOperatorDetail(g.operator, dateBounds());
+      });
+    });
+    bodyEl.querySelectorAll("details.line-card .line-card-detail").forEach(btn=>{
+      btn.addEventListener("click",e=>{
+        e.preventDefault();
+        e.stopPropagation();
+        const row=LINES[+btn.closest("details.line-card").dataset.idx];
+        if(row) openLineDetail(row.key, dateBounds());
+      });
+    });
     bodyEl.querySelectorAll("details.line-card").forEach(el=>{
       el.addEventListener("toggle",()=>{
         const row=LINES[+el.dataset.idx];
@@ -440,6 +476,7 @@
     return `<details class="line-card"${isOpen?" open":""} data-idx="${idx}">
       <summary class="line-card-head">${badge(r.key)}
         <span class="line-card-meta">${fmtN(r.distanceKm)} km · ${fmtN(r.count)} ${r.count===1?"Fahrt":"Fahrten"} · ${fmtN(nR)} ${nR===1?"Laufweg":"Laufwege"}</span>
+        <button type="button" class="line-card-detail" title="Detailseite mit Statistiken und Netzplan">Details →</button>
       </summary>
       <div class="line-card-body">
         ${bars}

@@ -78,11 +78,14 @@ EDGE_KIND_LABEL = {"override": "Fahrt", "default": "Standard", "": "—"}
 def _edge_patch_label(row):
     """Patch-Spalte der Kantenliste: Art und Anzahl der Via-Stationen."""
     kind = row.get("kind") or ""
+    split = "aufgeteilt" if row.get("split") else ""
     if not kind:
-        return "—"
+        return split or "—"
     if kind == "override" and not row.get("via"):
-        return "Fahrt: aus"
-    return "%s (%d Via)" % (EDGE_KIND_LABEL.get(kind, kind), len(row.get("via") or []))
+        label = "Fahrt: aus"
+    else:
+        label = "%s (%d Via)" % (EDGE_KIND_LABEL.get(kind, kind), len(row.get("via") or []))
+    return label + (", " + split if split else "")
 
 TAG_KEY_SUGGESTIONS = (
     "trwl:seat",
@@ -353,11 +356,26 @@ def _checkin_bits(status):
     }
 
 
+def _local_dt(ts):
+    """ISO-Zeitstempel als datetime in lokaler Zeit, sonst None.
+
+    Ohne Zone gilt der Zeitstempel als lokal.
+    """
+    if not isinstance(ts, str):
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.astimezone() if dt.tzinfo is not None else dt
+
+
 def _fmt_when(ts):
-    """ISO-Zeit kompakt als 'YYYY-MM-DD HH:MM' (ohne Zeitzonen-Umrechnung)."""
-    if not isinstance(ts, str) or len(ts) < 16:
+    """ISO-Zeit kompakt als 'YYYY-MM-DD HH:MM' in lokaler Zeit."""
+    dt = _local_dt(ts)
+    if dt is None:
         return ts or "—"
-    return ts[:10] + " " + ts[11:16]
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def _boarding_label(stop, api_so):
@@ -604,13 +622,9 @@ WEEKDAYS = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
 
 
 def weekday_label(ts):
-    """Kurzer Wochentag eines ISO-Zeitstempels (Ortszeit des Stempels) oder ""."""
-    if not isinstance(ts, str) or len(ts) < 10:
-        return ""
-    try:
-        return WEEKDAYS[datetime.date.fromisoformat(ts[:10]).weekday()]
-    except ValueError:
-        return ""
+    """Kurzer Wochentag eines ISO-Zeitstempels in lokaler Zeit oder ""."""
+    dt = _local_dt(ts)
+    return WEEKDAYS[dt.weekday()] if dt else ""
 
 
 def split_vehicle_numbers(text):
@@ -888,6 +902,92 @@ def refresh_trips(token, trip_ids, statuses_path, trips_path, stations_path):
         if hits:
             _write_json_atomic(statuses_path, data)
     return fresh, errors
+
+
+def resync_statuses(token, status_ids, statuses_path, trips_path, stations_path,
+                    operator_replacements_path):
+    """Lädt einzelne Statuses per GET /status/{id} und ersetzt sie in statuses.json.
+
+    Für Änderungen in Träwelling (Ausstieg, Einstieg, Linie …) außerhalb des
+    inkrementellen Fensters. Operator-Ersetzungen gelten wie beim Export.
+    `trip` bleibt bei gleicher Trip-ID; sonst kommt er aus trips.json oder
+    wird per `refresh_trips` neu abgerufen. Fehlt ein Status in der Datei,
+    wird er nach Abfahrt einsortiert. Gibt ({status_id: status},
+    {status_id: fehler}) zurück.
+    """
+    replacements = dl.load_operator_replacements(operator_replacements_path)
+    fresh, errors = {}, {}
+    for sid in status_ids:
+        try:
+            fresh[sid] = fetch_status(token, sid)
+        except dl.ApiError as e:
+            errors[sid] = str(e)
+    if not fresh:
+        return fresh, errors
+    dl.apply_operator_replacements(list(fresh.values()), replacements)
+    dl.strip_identifiers_from_statuses(list(fresh.values()))
+
+    data = []
+    if os.path.isfile(statuses_path):
+        with open(statuses_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise OSError(f"{statuses_path} enthält kein JSON-Array.")
+    old = {s.get("id"): s for s in data if isinstance(s, dict)}
+    trip_cache = None
+    missing = {}
+    for sid, status in fresh.items():
+        tid = (status.get("checkin") or {}).get("trip")
+        prev = old.get(sid) or {}
+        if "trip" in prev and (prev.get("checkin") or {}).get("trip") == tid:
+            status["trip"] = prev["trip"]
+            if prev.get("trip_error"):
+                status["trip_error"] = prev["trip_error"]
+            continue
+        if trip_cache is None:
+            trip_cache = dl.load_trip_cache(trips_path, statuses_path=statuses_path)
+        try:
+            stopovers = (trip_cache.get(int(tid)) or (None, None))[0]
+        except (TypeError, ValueError):
+            stopovers = None
+        if stopovers:
+            status["trip"] = {"stopovers": stopovers}
+        elif tid not in (None, ""):
+            missing[sid] = tid
+
+    replaced = set()
+    for i, item in enumerate(data):
+        if isinstance(item, dict) and item.get("id") in fresh:
+            data[i] = fresh[item["id"]]
+            replaced.add(item["id"])
+    added = [s for sid, s in fresh.items() if sid not in replaced]
+    if added:
+        far = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        data = sorted(data + added,
+                      key=lambda s: dl.status_sort_time(s) or far, reverse=True)
+    _write_json_atomic(statuses_path, data)
+
+    if missing:
+        trips, trip_errors = refresh_trips(token, missing, statuses_path,
+                                           trips_path, stations_path)
+        for sid, sts in trips.items():
+            fresh[sid]["trip"] = {"stopovers": sts}
+        for sid, err in trip_errors.items():
+            errors[sid] = f"Trip: {err}"
+    return fresh, errors
+
+
+def fetch_station_into_file(token, station_id, stations_path):
+    """GET /station/{id} und Eintrag in stations.json. Gibt den Eintrag oder None."""
+    station_cache = dl.load_station_cache(stations_path)
+    resolved = dl.resolve_stations(
+        [{"trip": {"stopovers": [{"id": station_id}]}}], token, cache={})
+    entry = resolved.get(station_id)
+    if not entry or entry.get("latitude") is None:
+        return None
+    station_cache[station_id] = entry
+    _write_json_atomic(stations_path, station_cache, trailing_newline=False)
+    return entry
 
 
 def fetch_status(token, status_id):
@@ -2048,6 +2148,10 @@ class EditorApp:
         )
         self.edge_menu_btn["menu"] = self.edge_menu
         self.edge_menu_btn.pack(side="left", padx=6)
+        self.edge_split_btn = ttk.Button(
+            edge_btns, text="Station aufteilen …", command=self._split_edge_station
+        )
+        self.edge_split_btn.pack(side="left")
         self._refresh_boarding()
 
     def _build_display_group(self, parent):
@@ -2244,6 +2348,7 @@ class EditorApp:
             stage_line_tags=self._stage_line_tags,
             filter_trips=self._filter_trips,
             clear_line_tags=self._clear_line_tags,
+            fetch_station=self._fetch_station,
         )
         self.settings_pages = {}
         for key, cls in es.PAGES.items():
@@ -2311,6 +2416,8 @@ class EditorApp:
     def _after_settings_change(self, kind):
         self.patches = ep.load_patches(self.edge_patches_path)
         self.station_patches = sp.load_patches(self.station_patches_path)
+        if self._station_server is not None:
+            self._station_server.set_patches(self.station_patches)
         self.line_color_patches = lcp.load_patches(self.line_color_patches_path)
         self.boarding_patches = bp.load_patches(self.boarding_patches_path)
         self.line_patches = self._read_line_patches()
@@ -2354,7 +2461,7 @@ class EditorApp:
         self._busy = busy
         state = "disabled" if busy else "normal"
         for btn in (self.save_btn, self.reload_btn, self.reload_menu_btn,
-                    self.dash_btn, self.edge_map_btn):
+                    self.dash_btn, self.edge_map_btn, self.edge_split_btn):
             btn.configure(state=state)
         self._sync_edge_menu()
         self._sync_dubi_buttons()
@@ -2585,10 +2692,58 @@ class EditorApp:
             label="Trip von Träwelling neu laden" + (f" ({n} Fahrten)" if n > 1 else ""),
             command=lambda: self._refresh_trips(targets),
         )
+        self.trip_menu.add_command(
+            label="Status von Träwelling übernehmen" + (f" ({n} Fahrten)" if n > 1 else ""),
+            command=lambda: self._resync_statuses(targets),
+        )
         x = event.x_root if event.x_root else self.trips.winfo_rootx() + 20
         y = event.y_root if event.y_root else self.trips.winfo_rooty() + 20
         self.trip_menu.tk_popup(x, y)
         return "break"
+
+    def _resync_statuses(self, statuses):
+        """Holt die Fahrten einzeln von Träwelling und schreibt sie in statuses.json."""
+        self._commit_edit()
+        self._flush_detail()
+        ids = [s["id"] for s in statuses if s.get("id") is not None]
+        if not ids:
+            return
+        if any(self._status_dirty(s) for s in statuses) and not messagebox.askyesno(
+            "Status übernehmen",
+            "Ungespeicherte Änderungen an diesen Fahrten gehen verloren. Fortfahren?",
+            parent=self.root,
+        ):
+            return
+        trips_path = os.path.join(os.path.dirname(self.statuses_path), "trips.json")
+
+        def work():
+            return resync_statuses(self.token, ids, self.statuses_path, trips_path,
+                                   self.stations_path, self.operator_replacements_path)
+
+        def done(result):
+            fresh, errors = result
+            for i, st in enumerate(self.statuses):
+                new = fresh.get(st.get("id"))
+                if new is None:
+                    continue
+                sid = new["id"]
+                self.statuses[i] = new
+                self._baseline[sid] = _snapshot_status(new)
+                self._original_tags[sid] = [
+                    _norm_tag(t) for t in (new.get("tags") or []) if _norm_tag(t)["key"]
+                ]
+                self._refresh_trip_row(new)
+                if self.current is not None and self.current.get("id") == sid:
+                    self.current = new
+                    self._on_select()
+            msg = (f"Status übernommen: {len(fresh)} von {len(ids)} Fahrten "
+                   f"in {self.statuses_path}.")
+            if errors:
+                msg += " Fehler: " + "; ".join(
+                    f"{sid}: {err}" for sid, err in sorted(errors.items(), key=str))
+            self._set_status(msg)
+
+        self._run_async(work, done, busy_msg="Lade Status von Träwelling …")
 
     def _refresh_trips(self, statuses):
         """Erzwingt den Neuabruf der Stopovers (überschreibt trips.json-Eintrag)."""
@@ -2752,9 +2907,10 @@ class EditorApp:
         bits = _checkin_bits(shown)
         self.title_var.set(f"{bits['line']} · {bits['origin']} → {bits['dest']}")
         dep, arr = bits["dep"], bits["arr"]
+        dep_dt, arr_dt = _local_dt(dep), _local_dt(arr)
         arr_text = (
-            arr[11:16] if isinstance(arr, str) and isinstance(dep, str)
-            and len(arr) >= 16 and arr[:10] == dep[:10] else _fmt_when(arr)
+            arr_dt.strftime("%H:%M") if dep_dt and arr_dt
+            and arr_dt.date() == dep_dt.date() else _fmt_when(arr)
         )
         when = f"{_fmt_when(dep)} → {arr_text}"
         day = weekday_label(dep)
@@ -3163,6 +3319,7 @@ class EditorApp:
         if not self.current:
             return
         sid = self.current.get("id")
+        splits = sp.split_rules(self.station_patches)
         for a, b in ep.consecutive_pairs(
             dl.traveled_stopovers(self._shown(self.current))
         ):
@@ -3180,6 +3337,7 @@ class EditorApp:
                 ),
                 "kind": kind,
                 "via": via,
+                "split": (a_id, b_id) in splits or (b_id, a_id) in splits,
             })
         for i, row in enumerate(self._edge_rows):
             self.edges.insert(
@@ -3203,6 +3361,39 @@ class EditorApp:
         if idx < 0 or idx >= len(self._edge_rows):
             return None
         return self._edge_rows[idx]
+
+    def _split_edge_station(self):
+        """Aufteilungs-Dialog mit den Enden der gewählten Kante."""
+        row = self._selected_edge()
+        if row is None:
+            messagebox.showinfo(
+                "Stationen", "Bitte zuerst eine Kante in der Liste wählen.",
+                parent=self.root,
+            )
+            return
+        es.ask_split(
+            self.root, self.settings_ctx,
+            on_saved=lambda: self._reload_visible_page("settings:stations"),
+            edge=(row["from_id"], row["to_id"]),
+        )
+
+    def _fetch_station(self, station_id, on_ok):
+        """Station per API in stations.json holen, dann `on_ok()` im UI-Thread."""
+        def work():
+            return fetch_station_into_file(self.token, station_id, self.stations_path)
+
+        def done(entry):
+            if entry is None:
+                messagebox.showerror(
+                    "Stationen",
+                    f"Station {station_id} ist bei Träwelling unbekannt oder ohne "
+                    "Koordinaten.",
+                    parent=self.root,
+                )
+                return
+            on_ok()
+
+        self._run_async(work, done, busy_msg=f"Lade Station {station_id} …")
 
     def _load_stations_file(self):
         try:
@@ -3576,7 +3767,7 @@ class EditorApp:
             if not since:
                 return
             day = datetime.datetime.strptime(since, "%Y-%m-%d")
-            cutoff = day.replace(tzinfo=datetime.timezone.utc)
+            cutoff = day.astimezone()
         elif mode == "normal" and not self.limit:
             cutoff = dl.incremental_cutoff(existing)
             if cutoff is None:

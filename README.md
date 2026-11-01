@@ -22,7 +22,7 @@ Die beiden Stufen können auch einzeln genutzt werden:
 | `status_editor.py` | Tag-Editor: Tags und Status-Text live auf Träwelling ändern, alle lokalen Patches und Einstellungen pflegen |
 | `editor_settings.py` | Einstellungsseiten des Tag-Editors, eine je Konfig-Datei |
 | `edge_patches.py` | Lokale Via-Patches (Default/Override) für grobe Kanten |
-| `station_patches.py` | Lokale Stations-Patches (Koordinaten verschieben, IDs mergen) |
+| `station_patches.py` | Lokale Stations-Patches (Koordinaten verschieben, IDs mergen, Stationen aufteilen) |
 | `line_color_patches.py` | Lokale Linienfarben-Patches je Status |
 | `boarding_patches.py` | Lokale Einstiegs-Patches je Status |
 | `home_region.py` | Lokale Operator-Liste der Heimatregion |
@@ -70,7 +70,7 @@ docker run -p 8080:8080 -v ./data:/app/data -e 'CRON_SCHEDULE=*/15 * * * *' wali
 ├── status_editor.py       # Tag-Editor (tkinter): Tags + Text live ändern
 ├── editor_settings.py     # Einstellungsseiten des Tag-Editors (je Konfig-Datei)
 ├── edge_patches.py        # Lokale Via-Patches für grobe Kanten
-├── station_patches.py     # Lokale Stations-Patches (Koordinaten / Merges)
+├── station_patches.py     # Lokale Stations-Patches (Koordinaten / Merges / Aufteilungen)
 ├── line_color_patches.py  # Lokale Linienfarben-Patches je Status
 ├── boarding_patches.py    # Lokale Einstiegs-Patches je Status
 ├── home_region.py         # Lokale Operator-Liste der Heimatregion
@@ -166,7 +166,7 @@ neu eingeloggt.
 | --- | --- |
 | `--limit N` | Maximal N Statuses laden (Tests) |
 | `--full` | Alle Statuses laden; ohne Flag nur neue und die letzten 2 Tage |
-| `--since YYYY-MM-DD` | Nur Statuses mit Abfahrt **strikt nach** diesem Tag |
+| `--since YYYY-MM-DD` | Nur Statuses mit Abfahrt **strikt nach** diesem Tag (Ortszeit des Rechners) |
 | `--skip-trips` | Keine Zwischenhalte nachladen (kein `/stopovers`) |
 | `--refresh-trips` | `trips.json`-Cache ignorieren, alle Trips neu von der API |
 | `--refresh-stations` | `stations.json`-Cache ignorieren, Koordinaten und Identifier neu auflösen |
@@ -182,7 +182,7 @@ neu eingeloggt.
 | `--ignore-plus` | `+` in Wagennummern **nicht** als Doppeltraktion trennen (Standard: `463001+463501` = zwei Fahrzeuge, siehe [Doppeltraktion](#doppeltraktion)) |
 | `--loc-class-families PFAD` | Baureihe→Familie für den Kartenfilter (Default `data/loc_class_families.txt`; JSON-Objekt, gleiche Baureihe darf mehrfach vorkommen) |
 | `--edge-patches PFAD` | [Kanten-Patches](#kanten-patches-physische-via-stationen) (Default `data/edge_patches.json`) |
-| `--station-patches PFAD` | [Stations-Patches](#stations-patches-koordinaten-und-merges) (Default `data/station_patches.json`) |
+| `--station-patches PFAD` | [Stations-Patches](#stations-patches-koordinaten-merges-aufteilungen) (Default `data/station_patches.json`) |
 | `--line-color-patches PFAD` | [Linienfarben-Patches](#linienfarben-patches) (Default `data/line_color_patches.json`) |
 | `--boarding-patches PFAD` | [Einstiegs-Patches](#einstiegs-patches) (Default `data/boarding_patches.json`) |
 | `--home-region PFAD` | [Heimatregion](#heimatregion) (Default `data/home_region.json`) |
@@ -225,7 +225,7 @@ und alle lokalen Einstellungen. Fehlt eine Einstellungsdatei, gilt sie als leer.
 | `trips.json` | Persistenter Cache der Zwischenhalte, je Trip-ID |
 | `dashboard.html` | Selbstständiges Dashboard (von `walita` / `build_dashboard`) |
 | `edge_patches.json` | Lokale Via-Patches für grobe Kanten (Tag-Editor / Karte; kein API-Write) |
-| `station_patches.json` | Lokale Stations-Patches: Koordinaten und Merges (Tag-Editor / Karte; kein API-Write) |
+| `station_patches.json` | Lokale Stations-Patches: Koordinaten, Merges und Aufteilungen (Tag-Editor / Karte; kein API-Write) |
 | `line_color_patches.json` | Lokale Linienfarben je Status (Tag-Editor; kein API-Write) |
 | `boarding_patches.json` | Lokaler Einstieg je Status (Tag-Editor; kein API-Write) |
 | `home_region.json` | Operatoren der Heimatregion (Tag-Editor; kein API-Write) |
@@ -357,13 +357,16 @@ Zwischenhalte mit `cancelled` („Entfällt“) zählen weder als gehalten noch 
 Durchfahrt und fehlen im Knotenmodell, bis sie als Via im Patch stehen.
 Tag `dubi=start` bzw. `dubi=ende` (Durchbindung): der Fahrtbeginn zählt nicht als Einstieg, das Fahrtende nicht als Ausstieg.
 
-### Stations-Patches (Koordinaten und Merges)
+### Stations-Patches (Koordinaten, Merges, Aufteilungen)
 
 Träwelling-Koordinaten sitzen manchmal neben der Strecke, und dieselbe physische
-Station kann unter zwei IDs vorkommen. In `data/station_patches.json` (gitignored)
-lassen sich Marker **verschieben** und IDs **zusammenführen** – **nur lokal**,
-kein Upload. Das Overlay liegt **vor** den Kanten-Patches: Merges schreiben
-Stopover-IDs auf den Survivor um, Moves überschreiben Lat/Lon. Der nächste Export
+Station kann unter zwei IDs vorkommen. Umgekehrt fasst Träwelling manchmal zwei
+getrennte Stationen unter einer ID zusammen, obwohl es die richtige Station mit
+eigener ID gibt. In `data/station_patches.json` (gitignored) lassen sich Marker
+**verschieben**, IDs **zusammenführen** und Stationen **aufteilen** – **nur
+lokal**, kein Upload. Das Overlay liegt **vor** den Kanten-Patches: Merges
+schreiben Stopover-IDs auf den Survivor um, Aufteilungen schreiben einzelne Halte
+auf die richtige Station um, Moves überschreiben Lat/Lon. Der nächste Export
 lässt `stations.json` / `statuses.json` unverändert.
 
 ```json
@@ -373,6 +376,9 @@ lässt `stations.json` / `statuses.json` unverändert.
   ],
   "merges": [
     { "from": 8002, "to": 8001 }
+  ],
+  "splits": [
+    { "station": 8003, "neighbor": 8004, "to": 8005 }
   ]
 }
 ```
@@ -381,14 +387,30 @@ lässt `stations.json` / `statuses.json` unverändert.
 - **Merge** `from → to`: `to` behält Name, Koordinaten und ID. Ketten werden
   flach aufgelöst (`A→B`, `B→C` → `A→C`); Zyklen werden verworfen. Ein Move auf
   die verschwindende `from`-ID gilt nicht für den Survivor.
+- **Aufteilung** `station` neben `neighbor` → `to`: Liegt ein Halt der Station
+  `station` im Laufweg direkt neben `neighbor` (davor oder danach, entfallene
+  Halte übersprungen), wird der ganze Halt zur Station `to`. Damit klappen
+  beide Richtungen um (`neighbor → station` wird `neighbor → to`,
+  `station → neighbor` wird `to → neighbor`), ebenso die zweite Kante an
+  diesem Halt. Ein- und Ausstieg folgen ihrem Halt; ohne Trip ist das andere
+  Ende des Check-ins der Nachbar. Je Nachbar eine Regel. Aufteilungen laufen
+  nach den Merges und nennen dieselben IDs wie die Rohdaten.
 - `edge_patches.json` bleibt bei Original-IDs (Unmerge bleibt möglich); beim
-  Dashboard-Bau werden Keys und Vias im Speicher umgeschrieben.
+  Dashboard-Bau werden Keys und Vias im Speicher umgeschrieben, bei
+  Aufteilungen wandert ein Kanten-Patch auf `station`–`neighbor` mit nach
+  `to`–`neighbor`.
 - Fehlende Datei = keine Änderung. Pfad: `--station-patches`
   (Default `data/station_patches.json`).
 - Nach dem Speichern im Tag-Editor das Dashboard neu bauen.
 
 Im Tag-Editor listet **Karte → Stationen** alle Verschiebungen (mit Abstand in
-Metern) und Zusammenlegungen; einzelne Einträge lassen sich dort löschen.
+Metern), Zusammenlegungen und Aufteilungen; einzelne Einträge lassen sich dort
+löschen. **Aufteilung hinzufügen …** fragt falsche Station, Nachbar (mit Anzahl
+der Kanten) und richtige Station (Vorschläge im Umkreis von 3 km, oder eine
+Träwelling-ID). Fehlt die richtige Station in `stations.json`, lädt der Editor
+sie per API nach und trägt sie dort ein. In der Kantenliste einer Fahrt öffnet
+**Station aufteilen …** denselben Dialog mit den beiden Enden der gewählten
+Kante; die Patch-Spalte zeigt „aufgeteilt“ an betroffenen Kanten.
 **Stationskarte öffnen** startet einen lokalen Server
 (`http://127.0.0.1:8712/`) mit Leaflet. Marker der befahrenen Stationen sind
 ziehbar (sofort gespeichert). Zwei Stationen wählen, **Wird aufgelöst** /
@@ -681,7 +703,10 @@ zusammengefügt. Sieben Ansichten:
 
   Stationen: Ein-/Ausstiege als Punkte, gefärbt nach Anzahl; gehaltene Stationen als weißer Kreis
   mit schwarzem Rand, physische Durchfahrten als kleiner, gedämpfter Punkt.
-  Die Checkbox **Entdeckte Kanten** (Standard aus) legt in Grau gerichtete
+  Ein Klick auf eine Station öffnet die **Lupe** (wie im Netzplan der
+  Linien-Detailseite) mit den Fahrten, die den aktuellen Filtern entsprechen:
+  Arme in geografischer Richtung, Spuren in Linienfarbe, die Tabelle nennt
+  die Linie; sie folgt Filteränderungen. Die Checkbox **Entdeckte Kanten** (Standard aus) legt in Grau gerichtete
   Stopover-Paare darüber, die unter dem aktuellen Filter nicht eingecheckt
   sind (z.B. auf dieser Linie nur im Laufweg gesehen). **Vollbild** (unter dem
   Zoom) zeigt nur die Karte im Vollbildmodus des Browsers; Esc beendet ihn.
@@ -689,7 +714,30 @@ zusammengefügt. Sieben Ansichten:
 
 - **Linien** – alle Linien gruppiert nach Operator; je Linie aggregierte
   gerichtete Laufwege (Perlschnur) und die Anteile der Baureihen (nach
-  Check-ins). Suche und Datumsbereich (Von/Bis).
+  Check-ins). Suche und Datumsbereich (Von/Bis). **Details →** öffnet die
+  Detailseite einer Linie (übernimmt den Datumsbereich, eigener Von/Bis):
+  Kennzahlen (Fahrten, km, Reisezeit, Punkte, Ø Verspätung, Pünktlichkeit,
+  Stationen, Kanten, Baureihen, Fahrzeuge), ein schematischer **Netzplan**
+  (geografisch angenähert, reine Durchfahrten verkürzt; Strecken nur in
+  45°-Winkeln mit gerundeten Knicken; drei Layoutverfahren zur Wahl,
+  **Luft raus**, **Luft raus (Stadt)** (dichte Gegenden im vollen Maßstab,
+  dünne gestaucht, Strecken behalten ihre geografische Richtung) und
+  **Bisher**; je Fahrtrichtung ein eigener Strich rechts der Mitte, Stärke =
+  Fahrten in dieser Richtung; gefahrene Übergänge an Abzweigen als Kurven;
+  Ein-/Ausstiege hervorgehoben; Tooltips mit Zählern; Knicke höchstens 90°;
+  standardmäßig in die Breite eingepasst, Zoom mit −/+/Einpassen, Ziehen
+  verschiebt). Ein Klick auf eine Station öffnet die **Lupe**: alle bisher
+  gefahrenen Beziehungen an diesem Knoten (aus Richtung A nach B, Einstieg,
+  Ausstieg) als einzelne Spuren mit Fahrtenzahl und Zeitraum; eine
+  Durchbindung (`dubi=ende` → `dubi=start`) zählt dort wie ein Halt. Dazu Fahrten je
+  Monat/Wochentag/Abfahrtsstunde sowie sortierbare Tabellen zu Baureihen,
+  Fahrzeugen, Stationen, Relationen, Kanten und allen Fahrten der Linie.
+  **Netzplan →** am Kopf eines Operators öffnet dieselbe Detailseite für
+  alle seine Linien: zusätzlich eine Tabelle der Linien, und im Netzplan
+  läuft jede Linie je Fahrtrichtung als eigener Strich in ihrer Farbe
+  (rechts gefahren; ohne Farbe aus den Daten: Ersatzfarbe), auf gemeinsamen
+  Abschnitten nebeneinander. Die Lupe
+  zeigt dort die Beziehungen je Linie.
 
 - **Statistiken** – Rankings zu Linien, Baureihen, Fahrzeugen und Stationen
   (Ein-/Ausstieg/gehalten/physische Durchfahrt, kombinierbare Filter), Kanten
@@ -798,7 +846,7 @@ Rechts stehen die Details der gewählten Fahrt in einklappbaren Gruppen:
 | Gruppe | Inhalt | Ziel |
 | --- | --- | --- |
 | Fahrzeug | Baureihe (Auswahl oder frei), Nummer ([Doppeltraktion](#doppeltraktion) mit `+`, z.B. `463001+463501`), Hinweis ob im Fuhrpark | Träwelling |
-| Fahrtverlauf | Einstieg, Durchbindung (`dubi=start` / `dubi=ende`), Kanten mit **Auf Karte anreichern** und **Patch entfernen ▾** | lokal (Durchbindung: Träwelling) |
+| Fahrtverlauf | Einstieg, Durchbindung (`dubi=start` / `dubi=ende`), Kanten mit **Auf Karte anreichern**, **Patch entfernen ▾** und **Station aufteilen …** | lokal (Durchbindung: Träwelling) |
 | Darstellung | Betreiber (für alle markierten Fahrten), Linie, Linienfarbe | Betreiber: Träwelling; Linie: lokal + Träwelling; Farbe: lokal |
 | Text & Tags | Status-Text, weitere Tags (Sitz, Wagen, …) | Träwelling |
 
@@ -934,6 +982,10 @@ Doppeltraktionen für `--ignore-plus`.
   2 Tage), **Vollständig** (Strg+Umschalt+R) und **Seit Datum …**.
 - **Tag-Editor:** Rechtsklick auf Fahrten → **Trip von Träwelling neu laden**
   holt die Halte der markierten Fahrten neu und überschreibt sie lokal.
+- **Tag-Editor:** Rechtsklick auf Fahrten → **Status von Träwelling übernehmen**
+  lädt die markierten Fahrten einzeln neu und schreibt sie in `statuses.json`,
+  etwa nach einem in Träwelling geänderten Ein- oder Ausstieg. **Von API
+  laden** ändert die Datei nicht; das Dashboard liest aber die Datei.
 - **Tag-Editor:** Zoom für hochauflösende Bildschirme: − / + in der
   Werkzeugleiste, Strg+Plus/Minus/0 oder `--scale` (auch
   `walita.py --edit --scale`). Schriften, Zeilen, Spalten, Checkboxen und
