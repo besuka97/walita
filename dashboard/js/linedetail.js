@@ -407,16 +407,20 @@ const lineDetail=(function(){
   const PAIR_MIN_KM=0.1;
   // Stauchungsfeld: Umkreis der Nachbarn, Glättung, stärkste Stauchung
   // (Faktor-Untergrenze; kleiner lässt Äste übereinanderfallen).
-  const FIELD_R_KM=2, FIELD_H_KM=1, FIELD_MIN=0.25, FIELD_SAMPLES=8;
+  const FIELD_R_KM=2, FIELD_H_KM=1, FIELD_MIN=0.25, FIELD_SAMPLES=8, BRANCH_STEP_KM=0.25, BRANCH_STEP_GRID=0.5;
   const OCT_PERP=1, OCT_LEN=0.1, OCT_ANCHOR=0.2;
   // Mindestabstand zwischen den Außenkanten zweier Haltestellenmarker (px).
   const MARK_GAP=15;
   // Reserve, weil gezeichnet wird auf den gerundeten Zügen.
-  const MARK_SLACK=2;
-  const PUSH_ROUNDS=40, PUSH_MS=800;
+  const MARK_SLACK=2, BAND_GAP=8;
+  const PUSH_ROUNDS=40, PUSH_MS=800, GROW_ROUNDS=2, GROW_IMPROVE_MS=300, FAN_MIN=3, FAN_TRIGGER=Math.PI/3;
+  const TIGHTEN_MS=200, UNTANGLE_ROUNDS=20, UNTANGLE_MS=400, UNTANGLE_MAX_TURN=Math.PI*3/8;
 
   const FORBIDDEN=1000;
   const MARK_HARD=FORBIDDEN, MARK_W=100;
+  // Bei festen Richtungen sind übereinanderliegende Strecken schlimmer als
+  // jeder verbotene Knick. Ohne sie würde stattdessen die Richtung geopfert.
+  const OVERLAP_COST=5*FORBIDDEN, ESCAPE_LEG=3, ESCAPE_COST=30, TILT_COST=5;
   function geoOf(sid){
     const st=(D().stations||{})[sid];
     if(!st || st[0]==null || st[1]==null) return null;
@@ -739,7 +743,8 @@ const lineDetail=(function(){
   //    Lage der Knoten zueinander, Kreuzungen, Abstände, Marker) samt
   //    Platz-Einschieben.
   // city: Variante „Stadt“ – Maßstab aus DEFLATE_CITY_Q, Querplatz für
-  // nicht verbundene Knotenpunkte, Richtungen in der Feinoptimierung fest.
+  // nicht verbundene Knotenpunkte, Außenäste nach Schritt 3 eingezogen,
+  // Richtungen in der Feinoptimierung fest.
   // Stauchungsfeld (Variante „Stadt“): je Halt der Maßstab, den sein Umfeld
   // braucht (Nachbarn im Umkreis FIELD_R_KM: Marker samt Abstand, auf
   // derselben Strecke mindestens ein Halteabstand). Größter Wert = Plan-
@@ -747,6 +752,7 @@ const lineDetail=(function(){
   // der mit dem Abstand abklingenden Faktoren (FIELD_H_KM). Längen sind die
   // geografische Strecke mal S mal dem mittleren Faktor entlang der Linie:
   // die Innenstadt steht am Anschlag, dünne Gegenden werden gestaucht.
+  // Außenäste verlieren danach auch den Sockel (pullInBranches).
   function compressionField(stops, geo, segs, segU, markOf){
     const ids=[...stops], minGeo=PAIR_MIN_KM/111, R=FIELD_R_KM/111, h=FIELD_H_KM/111;
     const along=new Map();
@@ -786,7 +792,117 @@ const lineDetail=(function(){
       for(let k=0;k<FIELD_SAMPLES;k++){ const t=(k+0.5)/FIELD_SAMPLES; m+=f(a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t); }
       return S*L*m/FIELD_SAMPLES;
     };
-    return {S, f, len};
+    // Länge ohne den Sockel FIELD_MIN: leere Gegend zählt nichts, Stadt voll.
+    const lenAboveFloor=(a,b)=>{
+      const L=Math.hypot(b[0]-a[0], b[1]-a[1]), n=Math.max(FIELD_SAMPLES, Math.ceil(L*111/BRANCH_STEP_KM));
+      let m=0;
+      for(let k=0;k<n;k++){ const t=(k+0.5)/n; m+=f(a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t)-FIELD_MIN; }
+      return S*L*m/n/(1-FIELD_MIN);
+    };
+    return {S, f, len, lenAboveFloor};
+  }
+  // Außenäste: Blätter abschälen, bis nur Ringe übrig sind (ein Baum wird
+  // ganz abgeschält). Liefert [Kante, äußerer Knoten, innerer Knoten] von
+  // außen nach innen.
+  function branchEdges(keyList, segs){
+    const inc=new Map(keyList.map(k=>[k,new Set()]));
+    segs.forEach((s,si)=>{
+      const a=s[0], b=s[s.length-1];
+      if(a!==b){ inc.get(a).add(si); inc.get(b).add(si); }
+    });
+    const stack=keyList.filter(k=>inc.get(k).size===1), out=[];
+    while(stack.length){
+      const k=stack.pop();
+      for(const si of inc.get(k)){
+        const s=segs[si], o=s[0]===k?s[s.length-1]:s[0];
+        out.push([si, k, o]);
+        inc.get(k).delete(si);
+        inc.get(o).delete(si);
+        if(inc.get(o).size===1) stack.push(o);
+      }
+    }
+    return out;
+  }
+  // Außenäste einziehen: von innen nach außen rückt jeder Knoten entlang der
+  // 45°-Richtung seiner Kante auf die Länge ohne Feldsockel, mindestens den
+  // Bedarf, und nur so weit, wie seine Halte neben allem schon Gesetzten
+  // Platz haben. Erst nach Einbettung und Richtungswahl, damit der Kern und
+  // die Richtungen von den vollen Längen bestimmt bleiben; kurze Kanten
+  // verlieren dort sonst ihre Richtung und verdrehen den Kern.
+  function pullInBranches(keyList, segs, dirs, P, want, need, field, geo, segU, markOf){
+    const peel=branchEdges(keyList, segs);
+    const trees=new Map();
+    for(const [, outer, inner] of peel){
+      if(!trees.has(inner)) trees.set(inner,[]);
+      trees.get(inner).push(outer, ...(trees.get(outer)||[]));
+    }
+    const old=new Map(keyList.map(k=>[k,[...P.get(k)]]));
+    const onBranch=new Set(peel.map(e=>e[0])), outerKeys=new Set(peel.map(e=>e[1]));
+    const placed=[];
+    // Halte einer Kante zwischen p und q, verteilt nach ihren Halteabständen.
+    const stopsOn=(si, p, q)=>{
+      const s=segs[si], u=segU[si], total=u[u.length-1]||1;
+      return s.slice(1,-1).map((id,i)=>{ const t=u[i+1]/total; return {id, p:[p[0]+(q[0]-p[0])*t, p[1]+(q[1]-p[1])*t]}; });
+    };
+    const fits=(items, skip)=>items.every(a=>placed.every(b=>{
+      if(b.id===skip) return true;
+      return Math.hypot(a.p[0]-b.p[0], a.p[1]-b.p[1])>=markOf(a.id).r+markOf(b.id).r+(MARK_GAP+MARK_SLACK)/U;
+    }));
+    for(const k of keyList) if(!outerKeys.has(k)) placed.push({id:k, p:P.get(k)});
+    segs.forEach((s,si)=>{ if(!onBranch.has(si)) placed.push(...stopsOn(si, P.get(s[0]), P.get(s[s.length-1]))); });
+    for(let i=peel.length-1;i>=0;i--){
+      const [si, outer, inner]=peel[i], s=segs[si], p=P.get(inner), d=dirs[si], sign=s[0]===inner?1:-1;
+      const a=old.get(inner), b=old.get(outer), full=Math.hypot(b[0]-a[0], b[1]-a[1]);
+      const at=len=>[p[0]+sign*d[0]*len, p[1]+sign*d[1]*len];
+      const items=len=>{
+        const q=at(len);
+        return [{id:outer, p:q}, ...(s[0]===inner?stopsOn(si, p, q):stopsOn(si, q, p))];
+      };
+      let len=Math.max(need[si], field.lenAboveFloor(geo.get(s[0]), geo.get(s[s.length-1])));
+      while(len<full && !fits(items(len), inner)) len+=BRANCH_STEP_GRID;
+      want[si]=Math.max(need[si], Math.min(len, want[si]));
+      placed.push(...items(want[si]));
+      P.set(outer, at(want[si]));
+    }
+    return {trees, peel};
+  }
+  // Volle Knoten only (ab FAN_MIN Kanten): einzeln gerundet schiebt eine Kante die
+  // nächste weiter, bis eine weit neben ihrer Richtung landet. Darum hier alle
+  // Kanten gemeinsam: die Zuordnung ohne doppelte Richtung mit der kleinsten
+  // quadratischen Abweichung von der Geografie. Knoten mit den meisten Kanten
+  // zuerst; schon vergebene Kanten bleiben. Liefert Kante → Oktant.
+  function fanDirections(segs, geo, only){
+    const step=Math.PI/4, inc=new Map(), fan=new Map();
+    segs.forEach((s,si)=>{
+      if(s[0]===s[s.length-1]) return;
+      for(const v of [s[0], s[s.length-1]]){ if(!inc.has(v)) inc.set(v,[]); inc.get(v).push(si); }
+    });
+    const nodes=[...inc].filter(([v,l])=>only.has(v) && l.length>=FAN_MIN && l.length<=8).sort((a,b)=>b[1].length-a[1].length);
+    const dist=(a,b)=>{ const d=Math.abs(a-b)%8; return Math.min(d, 8-d); };
+    for(const [v, list] of nodes){
+      const out=si=>{
+        const s=segs[si], o=s[0]===v?s[s.length-1]:s[0], p=geo.get(v), q=geo.get(o);
+        return Math.atan2(q[1]-p[1], q[0]-p[0])/step;
+      };
+      const toOut=(si, o)=>segs[si][0]===v?o:(o+4)%8;
+      const used=new Set(list.filter(si=>fan.has(si)).map(si=>toOut(si, fan.get(si))));
+      const free=list.filter(si=>!fan.has(si));
+      let best=null, bestCost=Infinity;
+      const pick=[];
+      (function walk(i, cost){
+        if(cost>=bestCost) return;
+        if(i===free.length){ best=[...pick]; bestCost=cost; return; }
+        const a=out(free[i]);
+        for(let o=0;o<8;o++){
+          if(used.has(o)) continue;
+          used.add(o); pick.push(o);
+          walk(i+1, cost+dist(a, o)**2);
+          pick.pop(); used.delete(o);
+        }
+      })(0, 0);
+      if(best) free.forEach((si,i)=>fan.set(si, toOut(si, best[i])));
+    }
+    return fan;
   }
   // Nächste 45°-Richtung je Kante (Oktant 0–7 von s[0] nach s[Ende]). Mit
   // dedup an keinem Knoten zwei Kanten in dieselbe Richtung: bei Doppelbelegung
@@ -795,10 +911,11 @@ const lineDetail=(function(){
   // prev: Oktanten der vorigen Runde; sie bleiben, solange die Kante nicht
   // mehr als OCT_KEEP Oktanten davon abweicht (sonst kippen Richtungen hin
   // und her).
-  function octDirections(segs, P, prev, dedup, turnCounts){
+  function octDirections(segs, P, prev, dedup, turnCounts, fan){
     const step=Math.PI/4;
     const act=segs.map(s=>{ const p=P.get(s[0]), q=P.get(s[s.length-1]); return Math.atan2(q[1]-p[1], q[0]-p[0])/step; });
     const oct=act.map((a,si)=>{
+      if(fan && fan.has(si)) return fan.get(si);
       if(prev){ let d=a-prev[si]; d=((d%8)+12)%8-4; if(Math.abs(d)<=OCT_KEEP) return prev[si]; }
       return ((Math.round(a)%8)+8)%8;
     });
@@ -866,14 +983,16 @@ const lineDetail=(function(){
             return [(x>0)+(y>0), runFrom(sk, a)+runFrom(sk, b), x+y];
           };
           const cmp=(p, q)=>p[0]-q[0]||p[1]-q[1]||p[2]-q[2];
-          // Reihenfolge: die weniger durchgehende (bei Gleichstand die stärker
-          // abweichende) Kante zu ihrer Seite, dann zur anderen; danach die
-          // andere Kante ebenso.
+          // Reihenfolge: zuerst beide Kanten zu der Seite, zu der sie ohnehin
+          // abweichen, die weniger durchgehende (bei Gleichstand die stärker
+          // abweichende) voran; erst dann gegen die Abweichung. Sonst schwenkt
+          // eine Kante über die andere, und ein Ring lässt sich nicht schließen.
           const c=cmp(straight(si), straight(sj));
           const first=c?(c<0?si:sj):(Math.abs(dev(si))>=Math.abs(dev(sj))?si:sj), second=first===si?sj:si;
-          const tries=[];
-          for(const mv of [first, second]){ const s=dev(mv)>=0?1:-1; tries.push([mv, s], [mv, -s]); }
+          const side=mv=>dev(mv)>=0?1:-1;
+          const tries=[[first, side(first)], [second, side(second)], [first, -side(first)], [second, -side(second)]];
           for(const [mv, step1] of tries){
+            if(fan && fan.has(mv)) continue;
             const a=segs[mv][0], b=segs[mv][segs[mv].length-1], prev=oct[mv];
             oct[mv]=((prev+step1)%8+8)%8;
             if(used(a, out(mv, a), mv) || used(b, out(mv, b), mv)){ oct[mv]=prev; continue; }
@@ -954,8 +1073,10 @@ const lineDetail=(function(){
     });
     const step=Math.PI/4;
     let dirs=[], octs=null;
+    const solveDirections=fan=>{
+    octs=null;
     for(let round=0; round<OCT_ROUNDS; round++){
-      octs=octDirections(segs, P, city?octs:null, city, turnCounts);
+      octs=octDirections(segs, P, city?octs:null, city, turnCounts, fan);
       dirs=octs.map(o=>[Math.cos(o*step), Math.sin(o*step)]);
       // Je Knoten ein kleines lineares Ausgleichsproblem: quer zur
       // gewählten Richtung streng (OCT_PERP), Länge schwach (OCT_LEN), Zug
@@ -979,13 +1100,37 @@ const lineDetail=(function(){
         }
       }
     }
+    };
+    solveDirections(null);
+    // Liegt an einem vollen Knoten eine Kante weit neben der Geografie, wählen
+    // dessen Kanten gemeinsam und alles wird neu gelöst. Nur dort: überall
+    // sonst hält die Einzelwahl gerade Durchfahrten.
+    if(city){
+      const off=new Set();
+      segs.forEach((s,si)=>{
+        const a=geo.get(s[0]), b=geo.get(s[s.length-1]);
+        let d=Math.abs(octs[si]*step-Math.atan2(b[1]-a[1], b[0]-a[0]))%(2*Math.PI);
+        d=Math.min(d, 2*Math.PI-d);
+        if(d>FAN_TRIGGER){ off.add(s[0]); off.add(s[s.length-1]); }
+      });
+      const fan=fanDirections(segs, geo, off);
+      if(fan.size){
+        for(const k of keyList) P.set(k,[...Q.get(k)]);
+        solveDirections(fan);
+      }
+    }
+    let branches=null;
+    if(field){
+      branches=pullInBranches(keyList, segs, dirs, P, want, need, field, geo, segU, markOf);
+      placeIslands(keyList, segs, geo, P);
+    }
     snapToGrid(keyList, P);
     if(city) alignAxes(keyList, segs, octs, P);
     const target=want.slice();
     target.geoLen=want.slice();
     target.scale=scale;
     const angles=dirs.map(d=>Math.atan2(d[1], d[0]));
-    const opt=optimizeLayout(segs, P, geo, target, turnPairs, segU, segHalf, markOf, {lean:true, angles, fixDir:city});
+    const opt=optimizeLayout(segs, P, geo, target, turnPairs, segU, segHalf, markOf, {lean:true, angles, fixDir:city, ...branches});
     return {K:P, opt};
   }
   function layoutKeys(segs, geo, segU, target){
@@ -1113,6 +1258,22 @@ const lineDetail=(function(){
     const d1=orient(c,d,a), d2=orient(c,d,b), d3=orient(a,b,c), d4=orient(a,b,d);
     return ((d1>e&&d2<-e)||(d1<-e&&d2>e)) && ((d3>e&&d4<-e)||(d3<-e&&d4>e));
   }
+  // Treffen sich zwei Linienzüge abseits der Punkte skip? Zählt auch Treffer
+  // auf Eckpunkten, parallele Abschnitte nicht.
+  function polylinesMeet(A, B, skip){
+    const e=1e-9;
+    for(let x=0;x+1<A.length;x++) for(let y=0;y+1<B.length;y++){
+      const a=A[x], b=A[x+1], c=B[y], d=B[y+1];
+      const den=(b[0]-a[0])*(d[1]-c[1])-(b[1]-a[1])*(d[0]-c[0]);
+      if(Math.abs(den)<e) continue;
+      const t=((c[0]-a[0])*(d[1]-c[1])-(c[1]-a[1])*(d[0]-c[0]))/den;
+      const u=((c[0]-a[0])*(b[1]-a[1])-(c[1]-a[1])*(b[0]-a[0]))/den;
+      if(t<-e || t>1+e || u<-e || u>1+e) continue;
+      const px=a[0]+t*(b[0]-a[0]), py=a[1]+t*(b[1]-a[1]);
+      if(!skip.some(q=>Math.hypot(q[0]-px, q[1]-py)<1e-6)) return true;
+    }
+    return false;
+  }
   function collinearOverlap(a,b,c,d){
     const ux=b[0]-a[0], uy=b[1]-a[1], L=Math.hypot(ux,uy);
     const vx=d[0]-c[0], vy=d[1]-c[1], M=Math.hypot(vx,vy);
@@ -1135,6 +1296,25 @@ const lineDetail=(function(){
     return L-h(m1,d1)-h(m2,d2)-(MARK_GAP+MARK_SLACK)/U;
   }
   function markCost(gap){ return gap<0?MARK_HARD+MARK_W*(-gap):0; }
+  // Nächster Punkt eines Linienzugs zu p.
+  function nearestOnPoly(p, pts){
+    let best=Infinity, at=pts[0];
+    for(let i=0;i+1<pts.length;i++){
+      const a=pts[i], b=pts[i+1], dx=b[0]-a[0], dy=b[1]-a[1], l=dx*dx+dy*dy;
+      const t=l?Math.max(0, Math.min(1, ((p[0]-a[0])*dx+(p[1]-a[1])*dy)/l)):0;
+      const q=[a[0]+t*dx, a[1]+t*dy], d=Math.hypot(p[0]-q[0], p[1]-q[1]);
+      if(d<best){ best=d; at=q; }
+    }
+    return {d:best, at};
+  }
+  // Abstand eines Markers zum Rand eines fremden Bands (ganze Bandbreite)
+  // über BAND_GAP hinaus; negativ = zu nah.
+  function bandGap(m, p, dir, s){
+    const {d, at}=nearestOnPoly(p, s.pts);
+    const ux=d?(at[0]-p[0])/d:1, uy=d?(at[1]-p[1])/d:0;
+    const h=dir?m.a*Math.abs(ux*dir[0]+uy*dir[1])+m.b*Math.abs(-ux*dir[1]+uy*dir[0]):m.r;
+    return {gap:d-h-s.half-BAND_GAP/U, at};
+  }
   // opts.lean: Richtung aus opts.angles statt Geografie und streng
   // gehalten, ohne gleichmäßige Streckung.
   function optimizeLayout(segs, P, geo, target, turnPairs, segU, segHalf, markOf, opts={}){
@@ -1146,7 +1326,7 @@ const lineDetail=(function(){
       for(const m of s.slice(1,-1)){ const g=geo.get(m); side+=gx*(g[1]-ga[1])-gy*(g[0]-ga[0]); }
       const n=s.length-1, cu=segU[si], u=cu[n];
       const ideal=target[si], geoLen=Math.max(target.geoLen[si], 1e-3);
-      return {a, b, n, u, cu, ideal, geoLen, half:segHalf[si], geoAng:opts.angles?opts.angles[si]:Math.atan2(gy,gx), side:Math.sign(side), bend:0,
+      return {a, b, n, u, cu, ideal, geoLen, half:segHalf[si], geoAng:opts.angles?opts.angles[si]:Math.atan2(gy,gx), trueAng:Math.atan2(gy,gx), side:Math.sign(side), bend:0,
         mk:s.slice(1,-1).map(markOf), ma:markOf(a), mb:markOf(b)};
     });
     // Geografische Abgangsrichtung eines Teilstücks am Knoten v (zum
@@ -1180,6 +1360,7 @@ const lineDetail=(function(){
       const fl=Math.hypot(f[0]-p[0], f[1]-p[1])||1, ll=Math.hypot(l[0]-q[0], l[1]-q[1])||1;
       s.d0=[(f[0]-p[0])/fl, (f[1]-p[1])/fl];
       s.d1=[(l[0]-q[0])/ll, (l[1]-q[1])/ll];
+      s.l0=fl; s.l1=ll;
       if(s.bends){
         const o=orient(p, q, pts[1]);
         s.bendSide=Math.sign(o);
@@ -1201,7 +1382,7 @@ const lineDetail=(function(){
       // Verfahren „Luft raus“: Richtung aus dem 45°-Schritt streng halten.
       // Feste Richtungen: Drehen ist teurer als ein Markerverstoß, den löst
       // das Platz-Einschieben.
-      if(opts.fixDir) c+=d<=q8/4?0:d<=q8/2?1+4*(d-q8/4)/(q8/4):10*FORBIDDEN;
+      if(opts.fixDir) c+=d<1e-6?0:d<=q8/4?TILT_COST:d<=q8/2?TILT_COST+1+4*(d-q8/4)/(q8/4):docking && d<=q8?TILT_COST+5:10*FORBIDDEN;
       else if(opts.lean) c+=d<=q8/4?0:d<=2*q8?1+4*(d-q8/4)/(2*q8):FORBIDDEN;
       else c+=d<=2*q8?2*Math.max(0, d-q8)/(2*q8):d<=3*q8?1+8*(d-2*q8)/q8:FORBIDDEN;
       if(s.bends && s.side && s.bendSide!==s.side) c+=0.3;
@@ -1214,6 +1395,15 @@ const lineDetail=(function(){
       }
       return c;
     }
+    // Knickt ein Teilstück kurz hinter v und ist der Schenkel danach lang
+    // genug, kann es dort über eine Fluchtstrecke andocken (addEscapes) und
+    // liegt nicht auf der Nachbarkante.
+    let docking=false;
+    const canEscape=(s, v)=>{
+      if(!opts.fixDir || !s.bends) return false;
+      const pts=s.a===v?s.pts:[...s.pts].reverse(), leg=s.a===v?s.l0:s.l1;
+      return leg<=ESCAPE_LEG && Math.hypot(pts[2][0]-pts[1][0], pts[2][1]-pts[1][1])>=leg-1e-6;
+    };
     function nodeCost(v){
       const list=inc.get(v)||[];
       const dirs=list.map(i=>S[i].a===v?S[i].d0:S[i].d1);
@@ -1221,7 +1411,7 @@ const lineDetail=(function(){
       for(let i=0;i<dirs.length;i++) for(let j=i+1;j<dirs.length;j++){
         const dot=dirs[i][0]*dirs[j][0]+dirs[i][1]*dirs[j][1];
         const ang=Math.acos(Math.max(-1,Math.min(1,dot)));
-        if(ang<0.1) c+=100;
+        if(ang<0.1) c+=canEscape(S[list[i]], v)||canEscape(S[list[j]], v)?ESCAPE_COST:opts.fixDir?OVERLAP_COST:100;
         else if(dirs.length===2){
           // Knicke über 90° sind verboten.
           const turn=Math.PI-ang;
@@ -1244,10 +1434,11 @@ const lineDetail=(function(){
       const r=2.5+si.half+sj.half+MARK_GAP/U;
       if(bi[0]>bj[2]+r || bj[0]>bi[2]+r || bi[1]>bj[3]+r || bj[1]>bi[3]+r) return 0;
       let c=0;
+      const escape=[si.a, si.b].some(v=>(v===sj.a || v===sj.b) && (canEscape(si, v) || canEscape(sj, v)));
       for(let x=0;x<si.pts.length-1;x++) for(let y=0;y<sj.pts.length-1;y++){
         const a=si.pts[x], b=si.pts[x+1], e=sj.pts[y], f=sj.pts[y+1];
         if(properCross(a,b,e,f)) c+=25;
-        else if(collinearOverlap(a,b,e,f)) c+=60;
+        else if(collinearOverlap(a,b,e,f)) c+=escape?ESCAPE_COST:opts.fixDir?OVERLAP_COST:60;
       }
       // Abstände zählen ab den Bündelrändern. Halte nahe einem gemeinsamen
       // Knoten liegen zwangsläufig dicht am Nachbarstück; dort regeln die
@@ -1260,6 +1451,14 @@ const lineDetail=(function(){
       for(const v of [si.a, si.b]) if(v!==sj.a && v!==sj.b) c+=clear(polyDist(P.get(v), sj.pts)-hw);
       for(const v of [sj.a, sj.b]) if(v!==si.a && v!==si.b) c+=clear(polyDist(P.get(v), si.pts)-hw);
       for(const t of si.st) for(const u of sj.st) if(!nearShared(t) && Math.hypot(t[0]-u[0], t[1]-u[1])<0.7+hw) c+=25;
+      // Fremde Bänder stoßen Marker mit ihrer ganzen Breite ab.
+      if(opts.fixDir){
+        for(const [own, other] of [[si, sj], [sj, si]]){
+          own.st.forEach((t,x)=>{ if(!nearShared(t)) c+=markCost(bandGap(own.mk[x], t, own.sd[x], other).gap); });
+          if(own.a!==other.a && own.a!==other.b) c+=markCost(bandGap(own.ma, P.get(own.a), null, other).gap);
+          if(own.b!==other.a && own.b!==other.b) c+=markCost(bandGap(own.mb, P.get(own.b), null, other).gap);
+        }
+      }
       // Marker beider Teilstücke untereinander und gegen fremde Knotenpunkte.
       for(let x=0;x<si.st.length;x++){
         for(let y=0;y<sj.st.length;y++) c+=markCost(markGap(si.mk[x], si.st[x], si.sd[x], sj.mk[y], sj.st[y], sj.sd[y]));
@@ -1325,6 +1524,7 @@ const lineDetail=(function(){
     S.forEach(s=>{
       for(const [x,y] of [[s.a,s.b],[s.b,s.a]]){ if(!nbrSet.has(x)) nbrSet.set(x,new Set()); nbrSet.get(x).add(y); }
     });
+    const hardBreaks=c=>Math.floor(c/FORBIDDEN);
     function localCost(set){
       let c=0;
       const nodes=new Set();
@@ -1384,19 +1584,249 @@ const lineDetail=(function(){
     }
     // Feste Richtungen (opts.fixDir) sind eine echte Regel: ein Zug, nach dem
     // eine betroffene Kante weiter als 5,6° von ihrer Richtung abweicht,
-    // wird verworfen (statt gegen andere harte Kosten abgewogen).
+    // wird verworfen (statt gegen andere harte Kosten abgewogen). Eine schon
+    // schiefe Kante darf sich dabei nur nicht weiter verdrehen (was: Abweichung
+    // vor dem Zug), sonst hielte sie ihre Knoten fest.
     const dirOff=s=>{
       const p=P.get(s.a), q=P.get(s.b);
       let d=Math.abs(Math.atan2(q[1]-p[1], q[0]-p[0])-s.geoAng);
       return d>Math.PI?2*Math.PI-d:d;
     };
-    const dirBroken=set=>opts.fixDir && [...set].some(i=>S[i].a!==S[i].b && dirOff(S[i])>Math.PI/32);
+    const dirsOf=set=>new Map([...set].map(i=>[i, dirOff(S[i])]));
+    const dirBroken=(set, was)=>opts.fixDir && [...set].some(i=>S[i].a!==S[i].b && dirOff(S[i])>Math.max(Math.PI/32, was.get(i)+1e-9));
+    // Eingezogene Äste stehen auf Mindestlänge und hielten ihren Knoten fest;
+    // darum rückt er auch samt allen angehängten Ästen.
+    function moveWithBranches(v){
+      const tree=opts.trees&&opts.trees.get(v);
+      if(!tree) return false;
+      const group=[v, ...tree], inGroup=new Set(group);
+      const C=new Set(group.flatMap(k=>[...(inc.get(k)||[])]));
+      const start=group.map(k=>P.get(k));
+      const others=keys.filter(k=>!inGroup.has(k)).map(k=>P.get(k));
+      const free=(dx,dy)=>start.every(p=>others.every(q=>Math.abs(q[0]-p[0]-dx)>=0.5 || Math.abs(q[1]-p[1]-dy)>=0.5));
+      const place=(dx,dy)=>{ group.forEach((k,i)=>P.set(k,[start[i][0]+dx, start[i][1]+dy])); C.forEach(i=>geom(S[i])); };
+      const was=dirsOf(C);
+      let best=null, bestC=localCost(C)-1e-6;
+      for(const [dx,dy] of moves){
+        if(!free(dx,dy)) continue;
+        place(dx,dy);
+        if(dirBroken(C, was)) continue;
+        const c=localCost(C);
+        if(c<bestC){ bestC=c; best=[dx,dy]; }
+      }
+      place(...(best||[0,0]));
+      return !!best;
+    }
+    // Kreuzungen, die es in der Geografie nicht gibt.
+    const geoCrossing=new Map();
+    function crossesInGeo(i, j){
+      const k=i*S.length+j;
+      if(!geoCrossing.has(k)){
+        const line=si=>segs[si].map(x=>geo.get(x));
+        const shared=[S[i].a, S[i].b].filter(v=>v===S[j].a || v===S[j].b).map(v=>geo.get(v));
+        geoCrossing.set(k, polylinesMeet(line(i), line(j), shared));
+      }
+      return geoCrossing.get(k);
+    }
+    function falseCrossings(){
+      const out=[];
+      for(let i=0;i<S.length;i++) for(let j=i+1;j<S.length;j++){
+        const a=S[i].box, b=S[j].box;
+        if(a[0]>b[2] || b[0]>a[2] || a[1]>b[3] || b[1]>a[3]) continue;
+        const shared=[S[i].a, S[i].b].filter(v=>v===S[j].a || v===S[j].b).map(v=>P.get(v));
+        if(polylinesMeet(S[i].pts, S[j].pts, shared) && !crossesInGeo(i, j)) out.push([i, j]);
+      }
+      return out;
+    }
+    // Äste weichen einander aus: eine falsche Kreuzung löst der Ast, indem er
+    // sich samt allem, was an ihm hängt, um seinen Ansatzknoten dreht (die
+    // festen Richtungen schließen das im übrigen Feinschliff aus). Andere Äste
+    // am Knoten rücken dabei weiter, Kanten des Kerns bleiben stehen. Gilt
+    // nur, wenn weniger Kreuzungen bleiben, keine harte Regel neu bricht und
+    // keine gedrehte Kante mehr als UNTANGLE_MAX_TURN von der Geografie abweicht.
+    function untangleBranches(deadline){
+      if(!opts.peel) return;
+      const step=Math.PI/4;
+      const edgeOf=new Map(opts.peel.map(e=>[e[0], e]));
+      const outerEdge=new Map(opts.peel.map(e=>[e[1], e]));
+      const owners=si=>{
+        const out=[];
+        for(let e=edgeOf.get(si); e; e=outerEdge.get(e[2])) out.push(e);
+        return out;
+      };
+      const octAt=(si, v)=>{
+        const a=(S[si].a===v?S[si].geoAng:S[si].geoAng+Math.PI)/step;
+        return ((Math.round(a)%8)+8)%8;
+      };
+      // Drehungen für Ast e um k Achtel; null, wenn eine Kernkante im Weg ist.
+      const turnsFor=(e, k)=>{
+        const v=e[2], sign=Math.sign(k), turns=[[e, k]], moved=new Set([e[0]]);
+        for(let at=(octAt(e[0], v)+k+8)%8; ; at=(at+sign+8)%8){
+          const si=inc.get(v).find(i=>!moved.has(i) && octAt(i, v)===at);
+          if(si==null) return turns;
+          const o=edgeOf.get(si);
+          if(!o || o[2]!==v) return null;
+          turns.push([o, sign]);
+          moved.add(si);
+        }
+      };
+      const apply=turns=>{
+        const pos=new Map(), angles=new Map();
+        const put=(k, p)=>{ if(!pos.has(k)) pos.set(k, P.get(k)); P.set(k, p); };
+        for(const [e, k] of turns){
+          const c=Math.cos(k*step), n=Math.sin(k*step);
+          const inTree=new Set([e[1], ...(opts.trees.get(e[1])||[])]);
+          const before=new Map([...inTree, e[2]].map(x=>[x, P.get(x)]));
+          // Von innen nach außen, je Kante gerundet: so bleibt jede auf 45°.
+          for(const [si, outer, inner] of [...opts.peel].reverse()){
+            if(!inTree.has(outer)) continue;
+            const a=before.get(inner), b=before.get(outer), x=b[0]-a[0], y=b[1]-a[1], p=P.get(inner);
+            put(outer, [p[0]+Math.round(c*x-n*y), p[1]+Math.round(n*x+c*y)]);
+            angles.set(si, S[si].geoAng);
+            S[si].geoAng+=k*step;
+          }
+        }
+        return {pos, angles};
+      };
+      const undo=(pos, angles)=>{
+        pos.forEach((p,k)=>P.set(k,p));
+        angles.forEach((a,si)=>{ S[si].geoAng=a; });
+      };
+      const offCourse=si=>{
+        const d=Math.abs(S[si].geoAng-S[si].trueAng)%(2*Math.PI);
+        return Math.min(d, 2*Math.PI-d)>UNTANGLE_MAX_TURN;
+      };
+      for(let round=0; round<UNTANGLE_ROUNDS; round++){
+        const crossings=falseCrossings();
+        if(!crossings.length) return;
+        let fixed=false;
+        search: for(const [i, j] of crossings) for(const e of [...owners(i), ...owners(j)]) for(const k of [1,-1,2,-2,3,-3]){
+          if(Date.now()>deadline) return;
+          const turns=turnsFor(e, k);
+          if(!turns) continue;
+          const touched=new Set(inc.get(e[2]));
+          for(const [o] of turns) for(const x of [o[1], ...(opts.trees.get(o[1])||[])]) (inc.get(x)||[]).forEach(si=>touched.add(si));
+          const base=localCost(touched);
+          const {pos, angles}=apply(turns);
+          const taken=new Set(keys.map(x=>P.get(x).join(",")));
+          touched.forEach(si=>geom(S[si]));
+          if(taken.size===keys.length && ![...angles.keys()].some(offCourse) && falseCrossings().length<crossings.length && hardBreaks(localCost(touched))<=hardBreaks(base)){
+            fixed=true;
+            break search;
+          }
+          undo(pos, angles);
+          touched.forEach(si=>geom(S[si]));
+        }
+        if(!fixed) return;
+        shapePass();
+        improve(Math.min(deadline, Date.now()+40));
+      }
+    }
+    // Abgang von s an v und die Richtung, die s dort haben soll.
+    const departure=(s, v)=>s.a===v?s.d0:s.d1;
+    const wanted=(s, v)=>{ const a=s.geoAng+(s.a===v?0:Math.PI); return [Math.cos(a), Math.sin(a)]; };
+    const onCourse=(s, v)=>{ const d=departure(s, v), w=wanted(s, v); return d[0]*w[0]+d[1]*w[1]>=0.995; };
+    const misdocked=v=>(inc.get(v)||[]).filter(i=>S[i].a!==S[i].b && !onCourse(S[i], v)).length;
+    const sameAngle=v=>{
+      const dirs=(inc.get(v)||[]).filter(i=>S[i].a!==S[i].b).map(i=>departure(S[i], v));
+      return dirs.some((d,i)=>dirs.some((e,j)=>j>i && d[0]*e[0]+d[1]*e[1]>=0.995));
+    };
+    // Vor jeder Fluchtstrecke: Lässt sich ein voller Knoten rein im 45°-Raster
+    // lösen? Er rückt probeweise, jedes Teilstück nimmt die Form, mit der es
+    // in seiner Richtung abgeht (einzeln ginge das nicht: zwei Teilstücke
+    // müssen oft zugleich tauschen). Die Sehne darf dafür bis 22,5° neben der
+    // Richtung liegen, eine exakt liegende Kante bleibt exakt. Gilt nur ohne
+    // neuen harten Verstoß, ohne neue Kreuzung und ohne Abstandsfehlbetrag.
+    function dockOnGrid(){
+      const all=new Set(S.keys());
+      docking=true;
+      for(const v of keys){
+        const list=inc.get(v)||[];
+        if(list.length<FAN_MIN || !sameAngle(v) && !misdocked(v)) continue;
+        const shapeFor=()=>{
+          const taken=[];
+          for(const i of list){
+            const s=S[i], orig=s.bend;
+            if(s.a===s.b) continue;
+            const w=wanted(s, v);
+            const free=!taken.some(t=>t[0]*w[0]+t[1]*w[1]>=0.995);
+            const fit=!free?[]:octilinearShapes(P.get(s.a), P.get(s.b)).filter(sh=>{ s.bend=sh; geom(s); return onCourse(s, v); });
+            if(fit.length) taken.push(w);
+            s.bend=fit.length?fit[0]:orig;
+            geom(s);
+          }
+        };
+        const score=()=>[sameAngle(v)?Infinity:misdocked(v), hardBreaks(localCost(all)), falseCrossings().length, (worstMark(), openDeficit)];
+        const start=score(), orig=P.get(v), shapes=list.map(i=>S[i].bend);
+        const exact=list.filter(i=>S[i].a!==S[i].b && dirOff(S[i])<1e-6);
+        const put=(p, sh)=>{ P.set(v, p); list.forEach((i,n)=>{ S[i].bend=sh[n]; geom(S[i]); }); };
+        let best=null;
+        for(const [dx,dy] of [[0,0], ...moves]){
+          const p=[orig[0]+dx, orig[1]+dy];
+          if(!freeAt(v, p)) continue;
+          put(p, shapes);
+          if(exact.some(i=>dirOff(S[i])>1e-6)) continue;
+          shapeFor();
+          const c=score();
+          if(c[0]===Infinity || c[0]>=start[0] || c[1]>start[1] || c[2]>start[2] || c[3]>start[3]+1e-6) continue;
+          if(!best || c[0]<best.c[0] || c[0]===best.c[0] && Math.abs(dx)+Math.abs(dy)<best.steps) best={c, p, sh:list.map(i=>S[i].bend), steps:Math.abs(dx)+Math.abs(dy)};
+        }
+        best?put(best.p, best.sh):put(orig, shapes);
+      }
+      docking=false;
+    }
+    // Gehen zwei Teilstücke im selben Winkel ab, dockt eines über eine kurze
+    // Fluchtstrecke an: seine Ecke hinter dem Knoten wird mit gleich langen
+    // Schenkeln abgeschnitten. Die Abkürzung liegt bei einem 45°-Knick 22,5°
+    // neben beiden Richtungen, der Rest bleibt im 45°-Raster.
+    function addEscapes(){
+      const cut=(s, v)=>{
+        const pts=s.a===v?s.pts:[...s.pts].reverse();
+        const [p, b, n]=pts, leg=Math.hypot(b[0]-p[0], b[1]-p[1]), rest=Math.hypot(n[0]-b[0], n[1]-b[1]);
+        const at=[b[0]+(n[0]-b[0])*leg/rest, b[1]+(n[1]-b[1])*leg/rest];
+        const out=[p, at, ...pts.slice(rest-leg<1e-6?3:2)];
+        s.pts=s.a===v?out:out.reverse();
+        const d=[(at[0]-p[0]), (at[1]-p[1])], L=Math.hypot(d[0], d[1]);
+        if(s.a===v) s.d0=[d[0]/L, d[1]/L]; else s.d1=[d[0]/L, d[1]/L];
+      };
+      for(const [v, list] of inc) for(let i=0;i<list.length;i++) for(let j=i+1;j<list.length;j++){
+        const a=S[list[i]], b=S[list[j]];
+        if(a.a===a.b || b.a===b.b) continue;
+        const da=a.a===v?a.d0:a.d1, db=b.a===v?b.d0:b.d1;
+        if(da[0]*db[0]+da[1]*db[1]<0.995) continue;
+        const ok=[a, b].filter(s=>canEscape(s, v)).sort((x,y)=>(x.a===v?x.l0:x.l1)-(y.a===v?y.l0:y.l1));
+        if(ok.length) cut(ok[0], v);
+      }
+    }
+    // Das Platz-Einschieben dehnt Äste, die über die Trennlinie laufen. Danach
+    // fahren sie schrittweise wieder ein (von innen nach außen, der Teilbaum
+    // rückt mit), solange keine harte Regel und keine Kreuzung hinzukommt.
+    function tightenBranches(deadline){
+      if(!opts.peel) return;
+      for(const [si, outer, inner] of [...opts.peel].reverse()){
+        const s=S[si], a=s.geoAng+(s.a===inner?Math.PI:0);
+        const dx=Math.round(Math.cos(a)), dy=Math.round(Math.sin(a));
+        const group=[outer, ...(opts.trees.get(outer)||[])], inGroup=new Set(group);
+        const touched=new Set(group.flatMap(k=>[...(inc.get(k)||[])]));
+        while(s.len>s.ideal+1){
+          if(Date.now()>deadline) return;
+          const start=group.map(k=>P.get(k));
+          const base=localCost(touched), crossings=falseCrossings().length;
+          const place=(x,y)=>{ group.forEach((k,i)=>P.set(k,[start[i][0]+x, start[i][1]+y])); touched.forEach(i=>geom(S[i])); };
+          const free=!keys.some(k=>!inGroup.has(k) && start.some(p=>{ const q=P.get(k); return Math.abs(q[0]-p[0]-dx)<0.5 && Math.abs(q[1]-p[1]-dy)<0.5; }));
+          place(dx,dy);
+          if(free && Math.floor(localCost(touched)/FORBIDDEN)<=Math.floor(base/FORBIDDEN) && falseCrossings().length<=crossings) continue;
+          place(0,0);
+          break;
+        }
+      }
+    }
     function improve(deadline){
     for(let pass=0; pass<40 && Date.now()<deadline; pass++){
       let improved=false;
       for(const v of keys){
         const C=new Set(inc.get(v));
-        const base=localCost(C);
+        const base=localCost(C), was=dirsOf(C);
         const orig=P.get(v);
         let best=null, bestC=base-1e-6;
         // Verbotene Richtung oder Knicke am Knoten oder an seinen Nachbarn:
@@ -1407,25 +1837,26 @@ const lineDetail=(function(){
           if(!freeAt(v, cand)) continue;
           P.set(v, cand);
           C.forEach(i=>geom(S[i]));
-          if(dirBroken(C)) continue;
+          if(dirBroken(C, was)) continue;
           const c=localCost(C);
           if(c<bestC){ bestC=c; best=cand; }
         }
         P.set(v, best||orig);
         C.forEach(i=>geom(S[i]));
         if(best){ improved=true; continue; }
+        if(moveWithBranches(v)){ improved=true; continue; }
         // Kein Einzelzug hilft: zusammen mit einem Nachbarknoten verschieben
         // (löst etwa zwei verdrehte Teilstücke am selben Knoten).
         for(const w of nbrs.get(v)||[]){
           const C2=new Set([...inc.get(v), ...inc.get(w)]);
-          const ow=P.get(w);
+          const ow=P.get(w), was2=dirsOf(C2);
           let b2=null, b2C=localCost(C2)-1e-6;
           for(const [dx,dy] of moves){
             const cv=[orig[0]+dx, orig[1]+dy], cw=[ow[0]+dx, ow[1]+dy];
             if(!freeAt(v, cv, w) || !freeAt(w, cw, v)) continue;
             P.set(v, cv); P.set(w, cw);
             C2.forEach(i=>geom(S[i]));
-            if(dirBroken(C2)) continue;
+            if(dirBroken(C2, was2)) continue;
             const c=localCost(C2);
             if(c<b2C){ b2C=c; b2=[cv, cw]; }
           }
@@ -1439,11 +1870,18 @@ const lineDetail=(function(){
     }
     }
     improve(Date.now()+600);
+    untangleBranches(Date.now()+UNTANGLE_MS);
     // Platz einschieben: bleibt ein Markerpaar zu nah, rückt alles jenseits
     // der Mittellinie zwischen beiden (waagerecht oder senkrecht) um ganze
     // Rastereinheiten weg; kreuzende Teilstücke werden länger. Danach kurz
     // nachoptimieren, bis kein Paar mehr zu nah ist.
-    function worstMark(){
+    // Schlimmster offener Konflikt, skip: schon erfolglos versuchte. total ist
+    // openDeficit die Summe aller Fehlbeträge.
+    const conflictId=w=>w.p.join()+"|"+w.q.join();
+    let openDeficit=0;
+    function worstMark(skip){
+      let total=0;
+      const open=w=>!skip || !skip.has(conflictId(w));
       const M=[];
       const seen=new Set();
       for(const s of S){
@@ -1456,16 +1894,54 @@ const lineDetail=(function(){
         const p=M[i][1], q=M[j][1];
         if(Math.abs(p[0]-q[0])>3 || Math.abs(p[1]-q[1])>3) continue;
         const g=markGap(M[i][0], p, M[i][2], M[j][0], q, M[j][2]);
-        if(g<0 && (!worst || g<worst.g)) worst={g, p, q, d:M[i][2]||M[j][2]};
+        if(g>=0) continue;
+        total-=g;
+        const w={g, p, q, d:M[i][2]||M[j][2]};
+        if(open(w) && (!worst || g<worst.g)) worst=w;
       }
+      // Bandkonflikte erst, wenn kein Markerpaar mehr offen ist.
+      const pairOpen=!!worst;
+      if(opts.fixDir) S.forEach(s=>{
+        const add=(m, p, d)=>{
+          const b=bandGap(m, p, d, s);
+          if(b.gap>=0) return;
+          total-=b.gap;
+          if(pairOpen || (worst && b.gap>=worst.g)) return;
+          const away=Math.hypot(b.at[0]-p[0], b.at[1]-p[1])<1e-6;
+          const w={g:b.gap, p, q:away?[p[0]+0.01, p[1]+0.01]:b.at, d};
+          if(open(w)) worst=w;
+        };
+        for(const o of S){
+          if(o===s) continue;
+          const shared=[s.a, s.b].filter(v=>v===o.a || v===o.b).map(v=>P.get(v));
+          o.st.forEach((t,x)=>{
+            if(t[0]<s.box[0]-3 || t[0]>s.box[2]+3 || t[1]<s.box[1]-3 || t[1]>s.box[3]+3) return;
+            if(!shared.some(q=>Math.hypot(t[0]-q[0], t[1]-q[1])<1.5+o.half+s.half)) add(o.mk[x], t, o.sd[x]);
+          });
+        }
+        for(const k of keys){
+          if(k===s.a || k===s.b) continue;
+          const t=P.get(k);
+          if(t[0]<s.box[0]-3 || t[0]>s.box[2]+3 || t[1]<s.box[1]-3 || t[1]>s.box[3]+3) continue;
+          const o=S[inc.get(k)[0]];
+          add(o.a===k?o.ma:o.mb, t, null);
+        }
+      });
+      openDeficit=total;
       return worst;
     }
-    const pushUntil=Date.now()+PUSH_MS;
+    // Ein Schub zieht alles jenseits der Trennlinie auseinander. Bei festen
+    // Richtungen gilt er nur, wenn die Konflikte insgesamt kleiner werden;
+    // sonst wird er zurückgenommen und die Stelle übersprungen.
+    function insertSpace(){
+    const pushUntil=Date.now()+PUSH_MS, skip=new Set();
     for(let round=0; round<PUSH_ROUNDS && Date.now()<pushUntil; round++){
-      const w=worstMark();
+      const w=worstMark(skip);
       if(!w) break;
+      const id=conflictId(w), deficit=openDeficit;
       const ux=w.q[0]-w.p[0], uy=w.q[1]-w.p[1], L=Math.hypot(ux,uy);
-      if(L<1e-6) break;
+      if(L<1e-6){ skip.add(id); continue; }
+      const posBefore=keys.map(k=>[...P.get(k)]), bendBefore=S.map(s=>s.bend);
       // Schubrichtung: quer zur Strecke, wenn die Marker nebeneinander
       // liegen (Korridore bleiben gerade), sonst entlang der Strecke; ohne
       // Streckenrichtung (Knotenpunkte) nach dem Abstandsvektor.
@@ -1506,6 +1982,30 @@ const lineDetail=(function(){
       }
       S.forEach(geom);
       improve(Math.min(pushUntil, Date.now()+40));
+      if(!opts.fixDir) continue;
+      worstMark();
+      if(openDeficit<deficit-1e-6){ skip.clear(); continue; }
+      keys.forEach((k,i)=>P.set(k, posBefore[i]));
+      S.forEach((s,i)=>{ s.bend=bendBefore[i]; geom(s); });
+      skip.add(id);
+    }
+    }
+    insertSpace();
+    tightenBranches(Date.now()+TIGHTEN_MS);
+    // Bleibt ein Konflikt offen, wächst der Maßstab: alles verdoppelt behält
+    // jede Richtung exakt, und das Einschieben bekommt neuen Spielraum.
+    for(let grow=0; opts.fixDir && grow<GROW_ROUNDS && worstMark(); grow++){
+      for(const k of keys){ const p=P.get(k); P.set(k,[p[0]*2, p[1]*2]); }
+      for(const s of S){ s.ideal*=2; s.geoLen*=2; }
+      S.forEach(geom);
+      improve(Date.now()+GROW_IMPROVE_MS);
+      insertSpace();
+    }
+    if(opts.fixDir){
+      // Einschieben und Wachsen verschieben Knoten: Zugformen neu wählen.
+      shapePass();
+      dockOnGrid();
+      addEscapes();
     }
     return S;
   }
