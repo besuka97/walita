@@ -725,7 +725,7 @@ zusammengefügt. Sieben Ansichten:
   45°-Winkeln mit gerundeten Knicken; drei Layoutverfahren zur Wahl,
   **Luft raus**, **Luft raus (Stadt)** (dichte Gegenden im vollen Maßstab,
   dünne gestaucht, reine Außenäste auf Mindestabstand eingezogen und einander
-  ausweichend, Strecken behalten ihre geografische Richtung) und
+  ausweichend, lange Ringstrecken samt Ästen herangerückt, Strecken behalten ihre geografische Richtung) und
   **Bisher**; je Fahrtrichtung ein eigener Strich rechts der Mitte, Stärke =
   Fahrten in dieser Richtung; gefahrene Übergänge an Abzweigen als Kurven;
   Ein-/Ausstiege hervorgehoben; Tooltips mit Zählern; Knicke höchstens 90°;

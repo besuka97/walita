@@ -421,6 +421,7 @@ const lineDetail=(function(){
   // Bei festen Richtungen sind übereinanderliegende Strecken schlimmer als
   // jeder verbotene Knick. Ohne sie würde stattdessen die Richtung geopfert.
   const OVERLAP_COST=5*FORBIDDEN, ESCAPE_LEG=3, ESCAPE_COST=30, TILT_COST=5;
+  const PULL_RATIO=6, PULL_MIN=3, PULL_ROUNDS=200, PULL_MS=400, PULL_SLIDE=30;
   function geoOf(sid){
     const st=(D().stations||{})[sid];
     if(!st || st[0]==null || st[1]==null) return null;
@@ -1722,6 +1723,92 @@ const lineDetail=(function(){
         improve(Math.min(deadline, Date.now()+40));
       }
     }
+    // Lange Strecken in Ringen sind keine Äste, das Einziehen erreicht sie
+    // nicht. Ohne die gedehnten Teilstücke mit Halten zerfällt das Netz: das
+    // größte Stück bleibt, alle anderen rücken von außen nach innen samt ihren
+    // Ästen schrittweise heran. Maß ist Länge² je Halteabstand, so verteilt
+    // sich die Kürzung gleichmäßig über hintereinanderliegende Teilstücke.
+    // Kein Zug verdreht eine Kante oder bringt einen harten Verstoß, eine
+    // Kreuzung oder einen Abstandsfehlbetrag.
+    function pullInOuter(deadline){
+      const far=new Set([...S.keys()].filter(i=>S[i].a!==S[i].b && S[i].st.length>0 && S[i].len>=PULL_RATIO*S[i].u));
+      if(!far.size) return;
+      const part=new Map();
+      const groups=[];
+      for(const k of keys){
+        if(part.has(k)) continue;
+        const g=[k];
+        part.set(k, g);
+        for(const v of g) for(const i of inc.get(v)){
+          if(far.has(i)) continue;
+          const w=S[i].a===v?S[i].b:S[i].a;
+          if(!part.has(w)){ part.set(w, g); g.push(w); }
+        }
+        groups.push(g);
+      }
+      groups.sort((x,y)=>y.length-x.length);
+      const core=groups.shift();
+      const mid=core.reduce((m,k)=>{ const p=P.get(k); return [m[0]+p[0]/core.length, m[1]+p[1]/core.length]; }, [0,0]);
+      const away=g=>Math.max(...g.map(k=>{ const p=P.get(k); return Math.hypot(p[0]-mid[0], p[1]-mid[1]); }));
+      groups.sort((x,y)=>away(y)-away(x));
+      const deficit=()=>(worstMark(), openDeficit);
+      // Eine schiefe lange Kante bremst jede Gruppe. Ihr Endknoten gleitet
+      // erst auf seiner anderen, exakten Kante, bis die lange exakt liegt.
+      const isCore=new Set(core);
+      for(const i of far){
+        const s=S[i];
+        if(dirOff(s)<1e-6) continue;
+        for(const k of [s.a, s.b]){
+          const list=[...inc.get(k)], o=S[list.find(j=>j!==i)];
+          if(isCore.has(k) || list.length!==2 || dirOff(o)>1e-6) continue;
+          const p=P.get(k), a=o.geoAng, d=[Math.round(Math.cos(a)), Math.round(Math.sin(a))];
+          const touched=new Set(list), hard=hardBreaks(localCost(touched)), crossings=falseCrossings().length, gap=deficit();
+          const hit=[...Array(2*PULL_SLIDE+1).keys()].map(n=>n-PULL_SLIDE).sort((x,y)=>Math.abs(x)-Math.abs(y)).find(t=>{
+            const q=[p[0]+t*d[0], p[1]+t*d[1]];
+            if(!t || !freeAt(k, q)) return false;
+            P.set(k, q);
+            touched.forEach(j=>geom(S[j]));
+            return dirOff(s)<1e-6 && dirOff(o)<1e-6 && o.len>=PULL_MIN*o.u && hardBreaks(localCost(touched))<=hard && falseCrossings().length<=crossings && deficit()<=gap+1e-6;
+          });
+          P.set(k, hit===undefined?p:[p[0]+hit*d[0], p[1]+hit*d[1]]);
+          touched.forEach(j=>geom(S[j]));
+          if(hit!==undefined) break;
+        }
+      }
+      for(let round=0, moved=true; moved && round<PULL_ROUNDS; round++){
+        moved=false;
+        for(const g of groups){
+          if(Date.now()>deadline) return;
+          const inGroup=new Set(g);
+          const touched=new Set(g.flatMap(k=>[...inc.get(k)]));
+          const edge=[...touched].filter(i=>inGroup.has(S[i].a)!==inGroup.has(S[i].b));
+          const start=g.map(k=>P.get(k));
+          const others=keys.filter(k=>!inGroup.has(k)).map(k=>P.get(k));
+          const free=(dx,dy)=>start.every(p=>others.every(q=>Math.abs(q[0]-p[0]-dx)>=0.5 || Math.abs(q[1]-p[1]-dy)>=0.5));
+          const place=(dx,dy)=>{ g.forEach((k,i)=>P.set(k,[start[i][0]+dx, start[i][1]+dy])); touched.forEach(i=>geom(S[i])); };
+          const energy=()=>edge.reduce((e,i)=>e+S[i].len*S[i].len/S[i].u, 0);
+          const before=energy(), was=dirsOf(touched), lens=new Map(edge.map(i=>[i, S[i].len]));
+          const exact=[...touched].filter(i=>S[i].a!==S[i].b && dirOff(S[i])<1e-6);
+          const hard=hardBreaks(localCost(touched)), crossings=falseCrossings().length, gap=deficit();
+          const tries=[];
+          for(const [dx,dy] of moves){
+            if(!free(dx,dy)) continue;
+            place(dx,dy);
+            if(dirBroken(touched, was) || exact.some(i=>dirOff(S[i])>1e-6) || edge.some(i=>S[i].len<lens.get(i) && S[i].len<PULL_MIN*S[i].u)) continue;
+            const e=energy();
+            if(e<before-1e-6) tries.push([e, dx, dy]);
+          }
+          tries.sort((x,y)=>x[0]-y[0]);
+          let hit=null;
+          for(const [, dx, dy] of tries){
+            place(dx,dy);
+            if(hardBreaks(localCost(touched))<=hard && falseCrossings().length<=crossings && deficit()<=gap+1e-6){ hit=[dx,dy]; break; }
+          }
+          place(...(hit||[0,0]));
+          if(hit) moved=true;
+        }
+      }
+    }
     // Abgang von s an v und die Richtung, die s dort haben soll.
     const departure=(s, v)=>s.a===v?s.d0:s.d1;
     const wanted=(s, v)=>{ const a=s.geoAng+(s.a===v?0:Math.PI); return [Math.cos(a), Math.sin(a)]; };
@@ -2002,6 +2089,7 @@ const lineDetail=(function(){
       insertSpace();
     }
     if(opts.fixDir){
+      pullInOuter(Date.now()+PULL_MS);
       // Einschieben und Wachsen verschieben Knoten: Zugformen neu wählen.
       shapePass();
       dockOnGrid();
