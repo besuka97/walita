@@ -743,6 +743,13 @@ zusammengefügt. Sieben Ansichten:
   Abschnitten nebeneinander. Die Lupe
   zeigt dort die Beziehungen je Linie.
 
+- **Netzplan** – startet leer. Je Attribut (Linie, Baureihe oder Familie,
+  Fahrzeug, Kategorie, Operator, Jahr) ein Dropdown mit Mehrfachauswahl; jeder
+  gewählte Wert fügt dem Plan seine Fahrten hinzu, Von/Bis begrenzen das
+  Ergebnis. Der Plan sieht aus wie der eines Operators, mit Lupe und Layoutwahl.
+  Ab 300 Fahrten startet die Berechnung erst auf Knopfdruck, weil sie die Seite
+  länger blockiert.
+
 - **Statistiken** – Rankings zu Linien, Baureihen, Fahrzeugen und Stationen
   (Ein-/Ausstieg/gehalten/physische Durchfahrt, kombinierbare Filter), Kanten
   (häufigste, zuletzt befahren, älteste Erstbefahrung, vergessene

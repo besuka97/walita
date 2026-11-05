@@ -271,6 +271,22 @@
         color:var(--fg); padding:4px 8px; border-radius:6px; cursor:pointer;
         font:inherit; font-size:12px; }
   .toolbar-btn:hover { border-color:var(--accent); background:var(--accent-soft); }
+  .np-btn { margin-left:0; }
+  #npBody > .hint { color:var(--muted); font-size:13px; }
+  .np-multi { position:relative; }
+  .np-open { background:var(--panel2); border:1px solid var(--border); color:var(--fg); border-radius:6px;
+        padding:3px 6px; font:inherit; font-size:12px; cursor:pointer; max-width:190px; min-width:70px;
+        overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left; }
+  .np-open::after { content:" ▾"; color:var(--muted); }
+  .np-menu { position:absolute; z-index:1000; top:100%; left:0; margin-top:3px; width:280px; max-width:calc(100vw - 32px);
+        background:var(--panel); border:1px solid var(--border); border-radius:8px; box-shadow:var(--shadow); padding:6px; }
+  .np-menu[hidden] { display:none; }
+  .np-menu input[type=search] { width:100%; box-sizing:border-box; margin-bottom:4px; }
+  .np-list { max-height:280px; overflow-y:auto; }
+  .np-list label { display:flex; align-items:center; gap:5px; padding:2px 3px; color:var(--fg); font-size:12px; cursor:pointer; }
+  .np-list label:hover { background:var(--accent-soft); }
+  .np-list input { margin:0; accent-color:var(--accent); }
+  .np-sub { color:var(--muted); font-size:11px; font-weight:700; margin:6px 3px 2px; }
   .daily-nav { width:30px; height:28px; border:1px solid var(--border); border-radius:8px; }
         background:var(--panel2); color:var(--fg); cursor:pointer; font-size:18px; line-height:1; }
   .daily-nav:hover { border-color:var(--accent); background:var(--accent-soft); }

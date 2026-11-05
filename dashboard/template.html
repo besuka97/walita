@@ -81,6 +81,7 @@
       </div>
       <button data-tab="map"><span class="ic">🗺️</span> Karte</button>
       <button data-tab="lines"><span class="ic">🛤️</span> Linien</button>
+      <button data-tab="netplan"><span class="ic">🕸️</span> Netzplan</button>
       <button data-tab="trips"><span class="ic">📋</span> Fahrten</button>
       <button data-tab="vehicles"><span class="ic">🚆</span> Fahrzeuge</button>
       <button data-tab="daily"><span class="ic">🏁</span> Tagesziele</button>
@@ -196,6 +197,21 @@
         <span class="muted" id="ldCount"></span>
       </div>
       <div id="ldBody"></div>
+    </section>
+
+    <section id="netplan" class="tab">
+      <div class="tab-head">
+        <h2>Netzplan</h2>
+        <p>Jeder gewählte Wert fügt dem Plan seine Fahrten hinzu.</p>
+      </div>
+      <div class="toolbar" id="npBar">
+        <label class="ctl">Von <input type="date" id="npFrom"></label>
+        <label class="ctl">Bis <input type="date" id="npTo"></label>
+        <label class="ctl"><input type="checkbox" id="npPassLabels"> Durchfahrten beschriften</label>
+        <button type="button" class="toolbar-btn np-btn" id="npClear">Auswahl löschen</button>
+        <span class="muted" id="npCount"></span>
+      </div>
+      <div id="npBody"></div>
     </section>
 
     <section id="trips" class="tab">

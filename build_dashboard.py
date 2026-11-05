@@ -2305,6 +2305,7 @@ _JS_FILES = (
     "js/wanted.js",
     "js/lines.js",
     "js/linedetail.js",
+    "js/netplan.js",
     "js/daily.js",
 )
 

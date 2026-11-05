@@ -7,22 +7,30 @@ const lineDetail=(function(){
   const dateToEl=document.getElementById("ldDateTo");
   const passLabelsEl=document.getElementById("ldPassLabels");
   const countEl=document.getElementById("ldCount");
-  const bodyEl=document.getElementById("ldBody");
   const BIT_BOARDED=1, BIT_ALIGHTED=2, BIT_THROUGH=4, BIT_PASSED=8;
   const WEEKDAYS=["Mo","Di","Mi","Do","Fr","Sa","So"];
   const MONTHS=["Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"];
   // Entweder eine Linie (current = Linien-Key) oder ein Unternehmen
   // (opScope = Operatorname, alle seine Linien).
   let current=null, opScope=null;
+  // Seite, die gerade einen Plan zeigt: eigener Container, Zoom, Lupenkontext
+  // und Linienfarben. scope (Prädikat auf Fahrten) und title gehören zu einem
+  // frei zusammengestellten Plan und ersetzen dort Linie und Unternehmen.
+  function planView(body, pass){
+    return {body, pass, ctx:null, zoom:null, colors:new Map(), scope:null, title:""};
+  }
+  const detailView=planView(document.getElementById("ldBody"), passLabelsEl);
+  let view=detailView;
+  const perLine=()=>view.scope!=null || opScope!=null;
   // Layoutverfahren des Netzplans: "deflate" (Luft raus) oder "classic".
   let planEngine="deflate";
   try{ planEngine=localStorage.getItem("trwl-plan-engine")||"deflate"; }catch(e){}
   let tables=[];
-  let opColors=new Map();
   // Ersatzfarben für Linien ohne HAFAS-Farbe in der Unternehmensansicht.
   const FALLBACK_COLORS=["#3d5a80","#e07a1f","#2a9d8f","#c1121f","#7b2cbf","#588157",
     "#b5838d","#1d4ed8","#a16207","#0f766e","#be185d","#4d7c0f"];
   function inScope(t){
+    if(view.scope) return view.scope(t);
     return opScope!=null ? lineOperator(t.line)===opScope : t.line===current;
   }
 
@@ -43,7 +51,7 @@ const lineDetail=(function(){
   }
   function opLineColor(key){
     const c=(D().lineColors||{})[key];
-    return c?[c[0], c[1]]:(opColors.get(key)||["var(--accent)","#fff"]);
+    return c?[c[0], c[1]]:(view.colors.get(key)||["var(--accent)","#fff"]);
   }
   // Farben der Linien eines Unternehmens: HAFAS-Farbe, sonst Ersatzpalette
   // in Reihenfolge der Fahrtenzahl.
@@ -51,11 +59,11 @@ const lineDetail=(function(){
     const n=new Map();
     for(const r of list) n.set(r.t.line, (n.get(r.t.line)||0)+1);
     const keys=[...n.keys()].sort((a,b)=>n.get(b)-n.get(a) || String(a).localeCompare(String(b),"de",{numeric:true}));
-    opColors=new Map();
+    view.colors=new Map();
     let k=0;
     for(const key of keys){
       if((D().lineColors||{})[key]) continue;
-      opColors.set(key, [FALLBACK_COLORS[k++%FALLBACK_COLORS.length], "#fff"]);
+      view.colors.set(key, [FALLBACK_COLORS[k++%FALLBACK_COLORS.length], "#fff"]);
     }
   }
   function opBadgeHtml(key){
@@ -71,7 +79,7 @@ const lineDetail=(function(){
   function rides(){
     const src=D();
     const trips=src.trips||[], edges=src.statEdges||[], stops=src.statStops||[];
-    const from=dateFromEl.value||"", to=dateToEl.value||"";
+    const from=view.scope?"":dateFromEl.value||"", to=view.scope?"":dateToEl.value||"";
     const out=[];
     trips.forEach((t,i)=>{
       if(!inScope(t)) return;
@@ -2463,7 +2471,7 @@ const lineDetail=(function(){
     const segs=segmentsOf(chains(adj), geo);
     // Halbe Bündelbreite je Kante in Rasterabständen: Unternehmensplan je
     // Richtung ein Strich pro Linie, Linienplan höchstens ein Strich je Richtung.
-    const opMode=opScope!=null;
+    const opMode=perLine();
     const edgeHalf=new Map();
     {
       const per=new Map();
@@ -2652,7 +2660,7 @@ const lineDetail=(function(){
     }
     if(opMode) opStrokes(list, routes, endAt, trimLen, band, strokes);
     const lines=strokes.map(s=>`<path d="${pathD(s.pts)}" stroke-width="${s.w.toFixed(1)}"${s.color?` stroke="${s.color}"`:""}><title>${esc(s.tip)}</title></path>`).join("");
-    const showPass=passLabelsEl.checked;
+    const showPass=view.pass.checked;
     const nodes=[], labels=[], hits=[];
     let bx0=Infinity, by0=Infinity, bx1=-Infinity, by1=-Infinity;
     function grow(b){ bx0=Math.min(bx0,b[0]); by0=Math.min(by0,b[1]); bx1=Math.max(bx1,b[2]); by1=Math.max(by1,b[3]); }
@@ -2750,12 +2758,12 @@ const lineDetail=(function(){
     const pad=8;
     const vx=bx0-pad, vy=by0-pad, vw=bx1-bx0+2*pad, vh=by1-by0+2*pad;
     const svg=`<svg class="ld-svg" viewBox="${vx.toFixed(1)} ${vy.toFixed(1)} ${vw.toFixed(1)} ${vh.toFixed(1)}"
-      width="${Math.ceil(vw)}" height="${Math.ceil(vh)}" role="img" aria-label="Schematischer Netzplan ${esc(opMode?opScope:lineName(current))}">
+      width="${Math.ceil(vw)}" height="${Math.ceil(vh)}" role="img" aria-label="Schematischer Netzplan ${esc(view.title||(opMode?opScope:lineName(current)))}">
       <g class="ld-edges" stroke="${color}">${lines}</g>
       <g class="ld-nodes" style="--ld-line:${color}">${nodes.join("")}</g>
       <g class="ld-labels">${labels.join("")}</g>
       <g class="ld-hits">${hits.join("")}</g></svg>`;
-    planCtx={adj, role, dirTo, pos, list, color};
+    view.ctx={adj, role, dirTo, pos, list, color};
     return `<div class="panel ld-plan"><h3>Netzplan <span class="muted">· schematisch, 45°-Raster · Station anklicken für die Lupe</span>
       <span class="ld-zoom ld-engine" title="Layoutverfahren">${[["deflate","Luft raus"],["city","Luft raus (Stadt)"],["classic","Bisher"]].map(([k,l])=>`<button type="button" data-engine="${k}" aria-pressed="${planEngine===k}">${l}</button>`).join("")}</span>
       <span class="ld-zoom"><button type="button" data-zoom="out" aria-label="Verkleinern">−</button><button type="button" data-zoom="fit">Einpassen</button><button type="button" data-zoom="in" aria-label="Vergrößern">+</button></span></h3>
@@ -2771,15 +2779,14 @@ const lineDetail=(function(){
   // ---------- Lupe: Fahrtbeziehungen an einem Knoten ----------
   // Arme in der Richtung des Plans; Durchbindungen innerhalb der Linie zählen
   // wie ein Halt.
-  let planCtx=null;
   function closeLens(){ lens.close(); }
   function openLens(sid, target){
     lens.close();
-    if(!planCtx || !planCtx.adj.has(sid)) return;
-    const plan=bodyEl.querySelector(".ld-plan"), svg=plan&&plan.querySelector(".ld-svg");
+    if(!view.ctx || !view.ctx.adj.has(sid)) return;
+    const plan=view.body.querySelector(".ld-plan"), svg=plan&&plan.querySelector(".ld-svg");
     if(!svg) return;
     const T=D().trips||[];
-    const p=planCtx.pos.get(sid);
+    const p=view.ctx.pos.get(sid);
     let ring=null;
     if(p){
       ring=document.createElementNS("http://www.w3.org/2000/svg","circle");
@@ -2788,15 +2795,17 @@ const lineDetail=(function(){
       svg.querySelector(".ld-hits").before(ring);
     }
     lens.open({
-      sid, list:planCtx.list, byLine:opScope!=null, parent:plan, target,
-      joins:opScope!=null?y=>inScope(T[y]):y=>T[y].line===current,
-      dirs:nb=>planCtx.dirTo.get(sid+"|"+nb)||[1,0],
-      colorOf:opScope!=null?m=>opLineColor(m.line)[0]:()=>planCtx.color,
+      sid, list:view.ctx.list, byLine:perLine(), parent:plan, target,
+      joins:perLine()?y=>inScope(T[y]):y=>T[y].line===current,
+      dirs:nb=>view.ctx.dirTo.get(sid+"|"+nb)||[1,0],
+      colorOf:perLine()?m=>opLineColor(m.line)[0]:()=>view.ctx.color,
       onClose:()=>{ if(ring) ring.remove(); },
     });
   }
   let dragged=false;
-  bodyEl.addEventListener("pointerdown", e=>{
+  function bindPlan(v){
+  v.body.addEventListener("pointerdown", e=>{
+    view=v;
     const wrap=e.target.closest(".ld-svg-wrap");
     if(!wrap || e.button!==0) return;
     const main=document.querySelector("main");
@@ -2820,13 +2829,14 @@ const lineDetail=(function(){
       window.addEventListener("pointerup", up);
     }
   });
-  bodyEl.addEventListener("click", e=>{
+  v.body.addEventListener("click", e=>{
+    view=v;
     if(dragged){ dragged=false; return; }
     const eb=e.target.closest("[data-engine]");
     if(eb){
       planEngine=eb.getAttribute("data-engine");
       try{ localStorage.setItem("trwl-plan-engine", planEngine); }catch(err){}
-      planZoom=null;
+      view.zoom=null;
       closeLens();
       render();
       return;
@@ -2834,18 +2844,21 @@ const lineDetail=(function(){
     const zb=e.target.closest("[data-zoom]");
     if(zb){
       const z=zb.getAttribute("data-zoom");
-      if(z==="fit"){ planZoom=null; applyZoom(); closeLens(); }
+      if(z==="fit"){ view.zoom=null; applyZoom(); closeLens(); }
       else zoomBy(z==="in"?1.25:0.8);
       return;
     }
     const t=e.target.closest(".ld-svg [data-sid]");
     if(t){ openLens(t.getAttribute("data-sid"), t); return; }
     const le=lens.element();
-    if(le && bodyEl.contains(le) && !le.contains(e.target)) closeLens();
+    if(le && view.body.contains(le) && !le.contains(e.target)) closeLens();
   });
+  }
+  bindPlan(detailView);
 
   // ---------- Seite ----------
   function render(){
+    if(view.scope){ renderScoped(); return; }
     if(current==null && opScope==null) return;
     const kpis=D().kpis||{};
     bindDateInput(dateFromEl, kpis.first, kpis.last);
@@ -2866,10 +2879,10 @@ const lineDetail=(function(){
     countEl.textContent=`${fmtN(list.length)} ${list.length===1?"Fahrt":"Fahrten"}`;
     tables=[];
     if(!list.length){
-      bodyEl.innerHTML=`<p class="hint">Keine Fahrten ${what} im gewählten Zeitraum.</p>`;
+      view.body.innerHTML=`<p class="hint">Keine Fahrten ${what} im gewählten Zeitraum.</p>`;
       return;
     }
-    bodyEl.innerHTML=kpiCards(list)
+    view.body.innerHTML=kpiCards(list)
       +netPlan(list)
       +timeCharts(list)
       +(opScope!=null?`<div class="ld-grid">${lineTable(list)}${locTable(list)}</div><div class="ld-grid">${vehTable(list)}</div>`
@@ -2877,12 +2890,18 @@ const lineDetail=(function(){
       +`<div class="ld-grid">${stationTable(list)}${relationTable(list)}</div>`
       +edgeTable(list)
       +tripTable(list);
-    bodyEl.querySelectorAll("table[data-ld-table]").forEach(paintTable);
+    view.body.querySelectorAll("table[data-ld-table]").forEach(paintTable);
+    fitPlan();
+  }
+  function renderScoped(){
+    const list=rides();
+    assignOpColors(list);
+    view.body.innerHTML=netPlan(list);
     fitPlan();
   }
   // Textbreiten sind nur geschätzt; sichtbar gerendert die echte Box nehmen.
   function fitPlan(){
-    const svg=bodyEl.querySelector(".ld-svg");
+    const svg=view.body.querySelector(".ld-svg");
     if(!svg) return;
     let b;
     try{ b=svg.getBBox(); }catch(e){ return; }
@@ -2894,32 +2913,31 @@ const lineDetail=(function(){
     applyZoom();
   }
   // Ohne eigene Wahl wird der Plan in die Breite eingepasst (nie vergrößert).
-  let planZoom=null;
   function fitScale(svg){
     const wrap=svg.parentNode;
     if(wrap.clientWidth<50) return 1;
     return Math.min(1, (wrap.clientWidth-16)/Number(svg.dataset.w));
   }
   function applyZoom(){
-    const svg=bodyEl.querySelector(".ld-svg");
+    const svg=view.body.querySelector(".ld-svg");
     if(!svg || !svg.dataset.w) return;
-    const z=planZoom==null?fitScale(svg):planZoom;
+    const z=view.zoom==null?fitScale(svg):view.zoom;
     svg.setAttribute("width", Math.ceil(Number(svg.dataset.w)*z));
     svg.setAttribute("height", Math.ceil(Number(svg.dataset.h)*z));
   }
   function zoomBy(f){
-    const svg=bodyEl.querySelector(".ld-svg");
+    const svg=view.body.querySelector(".ld-svg");
     if(!svg || !svg.dataset.w) return;
-    const wrap=svg.parentNode, z0=planZoom==null?fitScale(svg):planZoom;
+    const wrap=svg.parentNode, z0=view.zoom==null?fitScale(svg):view.zoom;
     const z=Math.max(0.2, Math.min(3, z0*f));
     // Mittelpunkt des sichtbaren Ausschnitts beibehalten
     const cx=(wrap.scrollLeft+wrap.clientWidth/2)/z0;
-    planZoom=z;
+    view.zoom=z;
     applyZoom();
     wrap.scrollLeft=cx*z-wrap.clientWidth/2;
     closeLens();
   }
-  window.addEventListener("resize", ()=>{ if(planZoom==null) applyZoom(); });
+  window.addEventListener("resize", ()=>{ if(view.zoom==null) applyZoom(); });
   function open(key, opts){
     opts=opts||{};
     current=key;
@@ -2932,7 +2950,8 @@ const lineDetail=(function(){
     show(opts||{});
   }
   function show(opts){
-    planZoom=null;
+    view=detailView;
+    view.zoom=null;
     closeLens();
     dateFromEl.value=opts.from||"";
     dateToEl.value=opts.to||"";
@@ -2948,9 +2967,32 @@ const lineDetail=(function(){
     el.addEventListener("input", render);
     el.addEventListener("change", render);
   });
-  passLabelsEl.addEventListener("change", render);
-  onHomeChange(render);
-  return {open, openOperator};
+  passLabelsEl.addEventListener("change", ()=>{ view=detailView; render(); });
+  onHomeChange(()=>{ view=detailView; render(); });
+  // Plan aus frei gewählten Fahrten für eine eigene Seite. draw(scope, title)
+  // zeichnet ihn neu, resume() passt ihn nach einem Seitenwechsel wieder ein.
+  function scopedPlan(body, pass){
+    const v=planView(body, pass);
+    bindPlan(v);
+    return {
+      draw(scope, title){
+        view=v;
+        closeLens();
+        v.zoom=null;
+        v.scope=scope;
+        v.title=title;
+        render();
+      },
+      clear(){
+        view=v;
+        closeLens();
+        v.ctx=null;
+        v.scope=null;
+      },
+      resume(){ view=v; applyZoom(); },
+    };
+  }
+  return {open, openOperator, scopedPlan};
 })();
 function openLineDetail(key, opts){ lineDetail.open(key, opts); }
 function openOperatorDetail(op, opts){ lineDetail.openOperator(op, opts); }
