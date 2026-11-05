@@ -550,6 +550,31 @@ def collect_used_ids(statuses, edge_patches=None, station_patches=None):
     return ids
 
 
+def ridden_ids(statuses, edge_patches=None):
+    """IDs, an denen ein Check-in vorbeikam: Halte im Abschnitt Start..Ziel
+    (Logik wie traveled_stopovers, ohne eindeutige Grenzen der ganze Trip)
+    und Via-Stationen der Kanten-Patches."""
+    ids = set()
+    for status in statuses or []:
+        if not isinstance(status, dict):
+            continue
+        checkin = status.get("checkin") or {}
+        _collect_stop_ids(checkin.get("origin"), ids)
+        _collect_stop_ids(checkin.get("destination"), ids)
+        trip = status.get("trip") or {}
+        stops = (trip.get("stopovers") or []) if isinstance(trip, dict) else []
+        i_start, i_end = _boundary_indices(checkin, stops)
+        if i_start is not None and i_end is not None and i_start <= i_end:
+            stops = stops[i_start:i_end + 1]
+        for stop in stops:
+            _collect_stop_ids(stop, ids)
+    ep = edge_patches or {}
+    for via in list((ep.get("defaults") or {}).values()) + list((ep.get("overrides") or {}).values()):
+        ids.update(via or ())
+    ids.discard(None)
+    return ids
+
+
 def set_move(patches, sid, lat, lon):
     coords = _parse_coord_pair(lat, lon)
     sid = station_id(sid)
@@ -641,6 +666,7 @@ class StationMapService:
         self.edge_patches = {"defaults": {}, "overrides": {}}
         self.patches = empty_patches()
         self.seen_days = {}
+        self.ridden = set()
         self._httpd = None
         self._thread = None
         self._lock = threading.Lock()
@@ -668,6 +694,7 @@ class StationMapService:
             self.statuses = list(statuses or [])
             self.seen_days = seen_dates(self.statuses)
             self.edge_patches = edge_patches or {"defaults": {}, "overrides": {}}
+            self.ridden = ridden_ids(self.statuses, self.edge_patches)
             self.patches = patches or empty_patches()
 
     def set_patches(self, patches):
@@ -688,7 +715,9 @@ class StationMapService:
         with self._lock:
             stations, statuses, edge_patches, patches, _path = self._snapshot()
             seen_days = self.seen_days
+            ridden_raw = self.ridden
         aliases = alias_map(patches)
+        ridden = {canonical_id(sid, aliases) for sid in ridden_raw}
         applied = apply_to_stations(patches, stations)
         used = collect_used_ids(statuses, edge_patches, patches)
         for sid in extra_ids or ():
@@ -705,6 +734,7 @@ class StationMapService:
             if not row:
                 continue
             row["moved"] = canon in (patches.get("moves") or {})
+            row["ridden"] = canon in ridden
             mapped.append(row)
         add_seen(mapped, seen_days)
         mapped.sort(key=lambda r: ((r.get("name") or ""), r["id"]))
@@ -738,7 +768,9 @@ class StationMapService:
         with self._lock:
             stations, _statuses, _edge, patches, _path = self._snapshot()
             seen_days = self.seen_days
+            ridden_raw = self.ridden
         aliases = alias_map(patches)
+        ridden = {canonical_id(sid, aliases) for sid in ridden_raw}
         applied = apply_to_stations(patches, stations)
         hits = search_stations(applied, query)
         out = []
@@ -753,6 +785,7 @@ class StationMapService:
                     continue
                 row = mapped
             row["moved"] = canon in (patches.get("moves") or {})
+            row["ridden"] = canon in ridden
             out.append(row)
             seen.add(canon)
         return add_seen(out, seen_days)

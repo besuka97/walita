@@ -3,7 +3,9 @@ let map=null, mapBounds=[], mapFitted=false;
 (function(){
   // Karte mit gültiger Startansicht initialisieren; fitBounds erst beim ersten
   // Anzeigen des Tabs, sonst rechnet Leaflet auf einem 0-Pixel-Container.
-  map=L.map("mapview",{preferCanvas:true,maxZoom:19}).setView([51,10],6);
+  // Den Schwung nach dem Loslassen rechnet flingAfterDrag; Leaflets eigener
+  // misst die Zeit erst im Handler und überschätzt gebündelte Touch-Events.
+  map=L.map("mapview",{preferCanvas:true,maxZoom:19,inertia:false}).setView([51,10],6);
   // Provider-Kette: schlägt einer fehl (DNS/Referer/Block), wird automatisch der
   // nächste versucht. Esri braucht keinen Referer und keinen API-Key.
   // maxZoom (einheitlich 19) erlaubt das Reinzoomen; über maxNativeZoom hinaus
@@ -513,6 +515,10 @@ let map=null, mapBounds=[], mapFitted=false;
   // (Rechtsverkehr), dazwischen eine feste Lücke. Weitere Fahrzeuge derselben
   // Richtung stapeln nach außen, nicht in die Gegenrichtung. Kurvenradius in
   // Pixeln, damit er beim Zoom konstant bleibt.
+  const DRAW_DELAY_MS=150;
+  const FLING_WINDOW_MS=100, FLING_MIN_SPAN_MS=20, FLING_MAX_SPEED=5000,
+    FLING_EASE=0.2, FLING_DECEL=3400;
+  let drawTimer=0, drawnZoom=null;
   const VEH_WEIGHT=3, CURVE_R=16, VEH_DIR_GAP=10, BADGE_MAX=3, BADGE_INSET=12;
   // Farbring in OKLCH: je Ton die kräftigste Farbe im sRGB-Raum, Helligkeit
   // nahe der Gamut-Spitze (Gelb hell, Blau dunkler), aber begrenzt, damit
@@ -1124,6 +1130,8 @@ let map=null, mapBounds=[], mapFitted=false;
     });
   }
   function draw(){
+    clearTimeout(drawTimer);
+    drawnZoom=map.getZoom();
     overlay.clearLayers();
     vDiscEdges.forEach(e=>{
       const weight=2, g=edgeGeom(e, weight);
@@ -1251,6 +1259,33 @@ let map=null, mapBounds=[], mapFitted=false;
   lg.onAdd=function(){ legendDiv=L.DomUtil.create("div","legend"); updateLegend(); return legendDiv; };
   lg.addTo(map);
 
+  // Schwung nach dem Loslassen. Die Geschwindigkeit kommt aus den Zeitstempeln
+  // der Eingabe-Events: sie stimmen auch dann, wenn der Browser die Events nach
+  // einer Blockade gebündelt zustellt.
+  function flingAfterDrag(){
+    let samples=[];
+    map.on("dragstart", ()=>{ samples=[]; });
+    map.on("drag", e=>{
+      const t=e.originalEvent ? e.originalEvent.timeStamp : performance.now();
+      samples.push({t, p:map.containerPointToLayerPoint([0,0])});
+      while(samples.length>2 && t-samples[0].t>FLING_WINDOW_MS) samples.shift();
+    });
+    map.on("dragend", ()=>{
+      const first=samples[0], last=samples[samples.length-1];
+      if(!first || performance.now()-last.t>FLING_WINDOW_MS) return;
+      const dt=(last.t-first.t)/1000;
+      if(dt<FLING_MIN_SPAN_MS/1000) return;
+      const dir=last.p.subtract(first.p), dist=dir.distanceTo([0,0]);
+      const speed=Math.min(dist/dt, FLING_MAX_SPEED)*FLING_EASE;
+      const duration=speed/(FLING_DECEL*FLING_EASE);
+      const offset=dir.multiplyBy(speed*duration/2/(dist||1)).round();
+      if(!offset.x && !offset.y) return;
+      // Nach dem moveend, das Leaflet direkt auf dragend feuert.
+      L.Util.requestAnimFrame(()=>map.panBy(offset,
+        {duration, easeLinearity:FLING_EASE, animate:true}));
+    });
+  }
+
   // Alles neu berechnen und zeichnen (Init + bei Filterwechsel). Der erste
   // fitBounds passiert beim ersten Anzeigen des Tabs (siehe nav-Handler) auf
   // Basis der hier gefüllten mapBounds; die Ansicht bleibt beim Filtern erhalten.
@@ -1268,7 +1303,16 @@ let map=null, mapBounds=[], mapFitted=false;
   applyScope();
   drawAll();
   onHomeChange(()=>{ applyScope(); drawAll(); });
-  map.on("moveend", draw);
+  // Linienversätze sind in Pixeln, ein neuer Zoom braucht also sofort neue
+  // Geometrie. Beim Verschieben ändern sich nur die Badges der Pfad-Modi: die
+  // folgen nach einer Bewegungspause, eine neue Bewegung bricht das ab.
+  map.on("movestart", ()=>clearTimeout(drawTimer));
+  map.on("moveend", ()=>{
+    clearTimeout(drawTimer);
+    if(map.getZoom()!==drawnZoom) draw();
+    else if(isPathMode()) drawTimer=setTimeout(draw, DRAW_DELAY_MS);
+  });
+  flingAfterDrag();
   // Lupe folgt der Station und den Filtern.
   function refreshLens(){ if(lensOnMap()) openLens(lens.sid()); }
   map.on("move zoom", ()=>{ if(lensOnMap()) lens.place(); });

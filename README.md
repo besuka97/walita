@@ -415,7 +415,10 @@ Kante; die Patch-Spalte zeigt „aufgeteilt“ an betroffenen Kanten.
 (`http://127.0.0.1:8712/`) mit Leaflet. Marker der befahrenen Stationen sind
 ziehbar (sofort gespeichert). Zwei Stationen wählen, **Wird aufgelöst** /
 **Bleibt**, dann **Zusammenführen**. Listen in der Sidebar setzen Moves und
-Merges zurück. Weitere Stationen per Name oder ID suchen. Internet nur für Kacheln.
+Merges zurück. Weitere Stationen per Name oder ID suchen. Grau sind Stationen,
+an denen nie ein Check-in vorbeikam: Sie stehen nur im Trip außerhalb von
+Start bis Ziel und sind auch keine Via-Station eines Kanten-Patches. Internet
+nur für Kacheln.
 
 Beide Karten haben zwei Datumsfelder. **Entdeckt ab** blendet Stationen aus,
 deren erste Fahrt (frühester Status, in dessen Trip die Stations-ID vorkommt)

@@ -109,7 +109,7 @@
     <div class="list" id="mergeList"></div>
   </div>
   <div class="legend">
-    Marker ziehen verschiebt sofort. Blau = Original, Grün = verschoben, Gelb = Auswahl.
+    Marker ziehen verschiebt sofort. Blau = Original, Grau = nie befahren (nur außerhalb eines Check-ins im Trip), Grün = verschoben, Gelb = Auswahl.
   </div>
   <div class="btns">
     <div id="msg"></div>
@@ -216,6 +216,7 @@
     let color="#5b95f7";
     if(sid(picked&&picked.id)===id) color="#fbbf24";
     else if(st.moved) color="#4ade80";
+    else if(st.ridden===false) color="#9ca3af";
     return L.divIcon({
       className:"st-dot",
       html:'<span style="background:'+color+'"></span>',
@@ -316,6 +317,7 @@
         title:st.name||String(st.id),
       }).addTo(map);
       m.bindPopup("<b>"+esc(st.name)+"</b><br>ID "+esc(st.id)+(st.moved?" · verschoben":"")
+        +(st.ridden===false?"<br>nie befahren":"")
         +(st.firstSeen?"<br>"+esc(seenText(st, "entdeckt", "zuletzt")):""));
       m.on("click", ()=>{
         if(dragging) return;
