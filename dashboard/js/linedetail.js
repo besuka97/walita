@@ -421,7 +421,7 @@ const lineDetail=(function(){
   // Bei festen Richtungen sind übereinanderliegende Strecken schlimmer als
   // jeder verbotene Knick. Ohne sie würde stattdessen die Richtung geopfert.
   const OVERLAP_COST=5*FORBIDDEN, ESCAPE_LEG=3, ESCAPE_COST=30, TILT_COST=5;
-  const PULL_RATIO=6, PULL_MIN=3, PULL_ROUNDS=200, PULL_MS=400, PULL_SLIDE=30;
+  const PULL_RATIO=6, PULL_MIN=1, PULL_ROUNDS=200, PULL_MS=400, PULL_SLIDE=30;
   function geoOf(sid){
     const st=(D().stations||{})[sid];
     if(!st || st[0]==null || st[1]==null) return null;
@@ -1728,8 +1728,9 @@ const lineDetail=(function(){
     // größte Stück bleibt, alle anderen rücken von außen nach innen samt ihren
     // Ästen schrittweise heran. Maß ist Länge² je Halteabstand, so verteilt
     // sich die Kürzung gleichmäßig über hintereinanderliegende Teilstücke.
-    // Kein Zug verdreht eine Kante oder bringt einen harten Verstoß, eine
-    // Kreuzung oder einen Abstandsfehlbetrag.
+    // Kein Zug kippt eine exakte Kante, verdreht eine andere von ihrer echten
+    // Richtung weg oder bringt einen harten Verstoß, eine Kreuzung oder einen
+    // Abstandsfehlbetrag.
     function pullInOuter(deadline){
       const far=new Set([...S.keys()].filter(i=>S[i].a!==S[i].b && S[i].st.length>0 && S[i].len>=PULL_RATIO*S[i].u));
       if(!far.size) return;
@@ -1775,9 +1776,16 @@ const lineDetail=(function(){
           if(hit!==undefined) break;
         }
       }
+      // Beide Enden einer langen Kante rücken auch gemeinsam: so wird ein Ring
+      // schmaler, und eine echte Kreuzung in ihm wandert nach innen.
+      const movers=[...groups, ...[...far].map(i=>[S[i].a, S[i].b])];
+      const trueOff=s=>{
+        const p=P.get(s.a), q=P.get(s.b), d=Math.abs(Math.atan2(q[1]-p[1], q[0]-p[0])-s.trueAng)%(2*Math.PI);
+        return Math.min(d, 2*Math.PI-d);
+      };
       for(let round=0, moved=true; moved && round<PULL_ROUNDS; round++){
         moved=false;
-        for(const g of groups){
+        for(const g of movers){
           if(Date.now()>deadline) return;
           const inGroup=new Set(g);
           const touched=new Set(g.flatMap(k=>[...inc.get(k)]));
@@ -1789,12 +1797,14 @@ const lineDetail=(function(){
           const energy=()=>edge.reduce((e,i)=>e+S[i].len*S[i].len/S[i].u, 0);
           const before=energy(), was=dirsOf(touched), lens=new Map(edge.map(i=>[i, S[i].len]));
           const exact=[...touched].filter(i=>S[i].a!==S[i].b && dirOff(S[i])<1e-6);
+          const real=new Map([...touched].map(i=>[i, trueOff(S[i])]));
+          const turned=()=>[...touched].some(i=>S[i].a!==S[i].b && dirOff(S[i])>Math.max(Math.PI/32, was.get(i)+1e-9) && (dirOff(S[i])>Math.PI/16 || trueOff(S[i])>=real.get(i)));
           const hard=hardBreaks(localCost(touched)), crossings=falseCrossings().length, gap=deficit();
           const tries=[];
           for(const [dx,dy] of moves){
             if(!free(dx,dy)) continue;
             place(dx,dy);
-            if(dirBroken(touched, was) || exact.some(i=>dirOff(S[i])>1e-6) || edge.some(i=>S[i].len<lens.get(i) && S[i].len<PULL_MIN*S[i].u)) continue;
+            if(turned() || exact.some(i=>dirOff(S[i])>1e-6) || edge.some(i=>S[i].len<lens.get(i) && S[i].len<PULL_MIN*S[i].u)) continue;
             const e=energy();
             if(e<before-1e-6) tries.push([e, dx, dy]);
           }
